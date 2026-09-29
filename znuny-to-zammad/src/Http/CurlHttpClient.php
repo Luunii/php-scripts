@@ -64,11 +64,12 @@ final class CurlHttpClient implements HttpClient
         if ($responseBody === false) {
             $error = curl_error($ch);
             $errno = curl_errno($ch);
-            curl_close($ch);
+            unset($ch);
             throw new ApiException(sprintf('HTTP-Anfrage %s %s fehlgeschlagen (curl %d): %s', $method, self::redact($url), $errno, $error));
         }
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        curl_close($ch);
+        // Kein curl_close(): ab PHP 8 wirkungslos, ab 8.5 veraltet - das Handle wird mit unset() freigegeben.
+        unset($ch);
 
         return new HttpResponse($status, (string) $responseBody);
     }

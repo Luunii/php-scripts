@@ -25,15 +25,20 @@ final class StateStore
     /** @var string|null */
     private $file;
 
+    /** @var bool */
+    private $readOnly;
+
     /** @var array<string,array<string,mixed>> */
     private $data = [];
 
     /**
-     * @param string|null $file null = nichts speichern (z. B. beim Trockenlauf)
+     * @param string|null $file     null = nur im Speicher halten
+     * @param bool        $readOnly Datei nur lesen (Trockenlauf)
      */
-    public function __construct(?string $file)
+    public function __construct(?string $file, bool $readOnly = false)
     {
-        $this->file = $file;
+        $this->file     = $file;
+        $this->readOnly = $readOnly;
         if ($file === null || !is_file($file)) {
             return;
         }
@@ -68,15 +73,9 @@ final class StateStore
         $this->save();
     }
 
-    public function remove(string $znunyTicketId): void
-    {
-        unset($this->data[$znunyTicketId]);
-        $this->save();
-    }
-
     private function save(): void
     {
-        if ($this->file === null) {
+        if ($this->file === null || $this->readOnly) {
             return;
         }
         $dir = dirname($this->file);

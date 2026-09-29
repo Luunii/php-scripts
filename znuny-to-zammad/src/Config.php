@@ -17,16 +17,21 @@ final class Config
     {
         return [
             'znuny' => [
+                'base_url'       => '',
+                'webservice'     => 'Znuny2Zammad',
                 'webservice_url' => '',
+                'routes'         => [],
                 'user'           => '',
                 'password'       => '',
                 'auth'           => 'session',
-                'agent_url'      => '',
+                'timezone'       => 'UTC',
                 'after_forward'  => [
-                    'note'         => true,
-                    'note_subject' => 'Ticket an Zammad weitergeleitet',
-                    'state'        => null,
-                    'queue'        => null,
+                    'note'                 => true,
+                    'note_subject'         => 'Ticket an Zammad weitergeleitet',
+                    'no_agent_notify'      => false,
+                    'state'                => null,
+                    'queue'                => null,
+                    'pending_diff_minutes' => 1440,
                 ],
             ],
             'zammad' => [
@@ -34,16 +39,9 @@ final class Config
                 'token'                   => '',
                 'default_group'           => '',
                 'group_map'               => [],
+                'group_from_queue'        => false,
                 'state'                   => null,
-                'state_map'               => [
-                    'new'                  => 'new',
-                    'open'                 => 'open',
-                    'pending reminder'     => 'pending reminder',
-                    'pending auto close+'  => 'pending close',
-                    'pending auto close-'  => 'pending close',
-                    'closed successful'    => 'closed',
-                    'closed unsuccessful'  => 'closed',
-                ],
+                'state_map'               => [],
                 'default_state'           => 'open',
                 'priority_map'            => [
                     '1 very low'  => '1 low',
@@ -62,13 +60,19 @@ final class Config
                 'dynamic_field_map'       => [],
             ],
             'forward' => [
-                'articles'            => 'all',
-                'include_internal'    => true,
-                'html_body'           => true,
-                'attachments'         => true,
-                'max_attachment_size' => 20 * 1024 * 1024,
-                'article_header'      => true,
-                'info_note'           => true,
+                'articles'                     => 'all',
+                'include_internal'             => true,
+                'include_system'               => true,
+                'keep_customer_emails'         => true,
+                'customer_auto_reply'          => false,
+                'html_body'                    => true,
+                'attachments'                  => true,
+                'max_attachment_size'          => 20 * 1024 * 1024,
+                'max_article_attachments_size' => 35 * 1024 * 1024,
+                'article_header'               => true,
+                'info_note'                    => true,
+                'suppress_notifications'       => true,
+                'display_timezone'             => 'Europe/Berlin',
             ],
             'batch' => [
                 'queues'      => [],
@@ -120,8 +124,10 @@ final class Config
     public static function merge(array $defaults, array $override): array
     {
         foreach ($override as $key => $value) {
+            // Ein leeres Array ersetzt den Standardwert (z. B. um eine Zuordnung zu leeren).
             if (
                 is_array($value)
+                && $value !== []
                 && isset($defaults[$key])
                 && is_array($defaults[$key])
                 && self::isAssoc($defaults[$key])
@@ -141,7 +147,7 @@ final class Config
     private static function validate(array $config): void
     {
         $required = [
-            'znuny.webservice_url'  => $config['znuny']['webservice_url'],
+            'znuny.base_url'        => $config['znuny']['base_url'] !== '' ? $config['znuny']['base_url'] : $config['znuny']['webservice_url'],
             'znuny.user'            => $config['znuny']['user'],
             'znuny.password'        => $config['znuny']['password'],
             'zammad.url'            => $config['zammad']['url'],
@@ -162,6 +168,13 @@ final class Config
         }
         if (!in_array($config['forward']['articles'], ['all', 'first', 'last'], true)) {
             throw new \RuntimeException('forward.articles muss "all", "first" oder "last" sein.');
+        }
+        foreach (['znuny.timezone' => $config['znuny']['timezone'], 'forward.display_timezone' => $config['forward']['display_timezone']] as $key => $timezone) {
+            try {
+                new \DateTimeZone((string) $timezone);
+            } catch (\Exception $e) {
+                throw new \RuntimeException(sprintf('%s: unbekannte Zeitzone "%s".', $key, $timezone));
+            }
         }
     }
 

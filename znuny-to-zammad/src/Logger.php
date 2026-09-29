@@ -27,9 +27,21 @@ final class Logger
     /** @var resource|null */
     private $file;
 
-    public function __construct(int $level = self::INFO, ?string $logFile = null)
+    /** @var resource */
+    private $stdout;
+
+    /** @var resource */
+    private $stderr;
+
+    /**
+     * @param resource|null $stdout
+     * @param resource|null $stderr
+     */
+    public function __construct(int $level = self::INFO, ?string $logFile = null, $stdout = null, $stderr = null)
     {
-        $this->level = $level;
+        $this->level  = $level;
+        $this->stdout = $stdout ?? STDOUT;
+        $this->stderr = $stderr ?? STDERR;
         if ($logFile !== null && $logFile !== '') {
             $handle = @fopen($logFile, 'ab');
             if ($handle === false) {
@@ -79,6 +91,6 @@ final class Logger
             return;
         }
         $line = ($level === self::INFO ? '' : $label . ': ') . $message . "\n";
-        fwrite($level >= self::WARN ? STDERR : STDOUT, $line);
+        fwrite($level >= self::WARN ? $this->stderr : $this->stdout, $line);
     }
 }

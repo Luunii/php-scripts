@@ -1,0 +1,67 @@
+---
+# Webservice fuer znuny2zammad
+# Import: Znuny > Admin > Webservices > Webservice hinzufuegen > "Webservice importieren"
+# oder:   bin/znuny.Console.pl Admin::WebService::Add --name Znuny2Zammad --source-path Znuny2Zammad.yml
+#         (Znuny 6.x: bin/otrs.Console.pl)
+#
+# DebugThreshold bitte auf "error" lassen: bei "debug" speichert Znuny Passwoerter und
+# komplette Anhaenge im Debug-Log der Datenbank.
+Debugger:
+  DebugThreshold: error
+  TestMode: '0'
+Description: Schnittstelle fuer znuny2zammad (Tickets lesen, Notiz/Status setzen)
+FrameworkVersion: 6.5.x
+Provider:
+  Operation:
+    SessionCreate:
+      Description: Create a Session
+      MappingInbound: {}
+      MappingOutbound: {}
+      Type: Session::SessionCreate
+    TicketGet:
+      Description: Retrieve Ticket data
+      MappingInbound: {}
+      MappingOutbound: {}
+      Type: Ticket::TicketGet
+    TicketSearch:
+      Description: Search for Tickets
+      MappingInbound: {}
+      MappingOutbound: {}
+      Type: Ticket::TicketSearch
+    TicketUpdate:
+      Description: Update a Ticket
+      MappingInbound: {}
+      MappingOutbound: {}
+      Type: Ticket::TicketUpdate
+  Transport:
+    Config:
+      AdditionalHeaders: ~
+      KeepAlive: '1'
+      MaxLength: '100000000'
+      RouteOperationMapping:
+        SessionCreate:
+          ParserBackend: JSON
+          RequestMethod:
+          - POST
+          Route: /Session
+        TicketGet:
+          ParserBackend: JSON
+          RequestMethod:
+          - GET
+          Route: /Ticket/:TicketID
+        TicketSearch:
+          ParserBackend: JSON
+          RequestMethod:
+          - POST
+          Route: /Ticket/Search
+        TicketUpdate:
+          ParserBackend: JSON
+          RequestMethod:
+          - PATCH
+          - POST
+          Route: /Ticket/:TicketID
+    Type: HTTP::REST
+RemoteSystem: ''
+Requester:
+  Transport:
+    Type: ''
