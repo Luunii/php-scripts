@@ -40,7 +40,7 @@ final class EmailAddress
     }
 
     /**
-     * Liefert die erste gueltige Adresse einer Liste.
+     * Liefert die erste gueltige Adresse einer Liste (E-Mail normalisiert, siehe normalize()).
      *
      * @return array{name:string,email:string}|null
      */
@@ -48,11 +48,50 @@ final class EmailAddress
     {
         foreach (self::parseList($list) as $address) {
             if (self::isValid($address['email'])) {
-                return ['name' => $address['name'], 'email' => mb_strtolower($address['email'])];
+                return ['name' => $address['name'], 'email' => self::normalize($address['email'])];
             }
         }
 
         return null;
+    }
+
+    /**
+     * Bringt eine Adresse in die Form, in der Zammad sie speichert: klein geschrieben,
+     * Umlaut-Domains in Unicode ("max@xn--mller-kva.de" -> "max@müller.de").
+     */
+    public static function normalize(string $email): string
+    {
+        $email = mb_strtolower(trim($email));
+        $at    = strrpos($email, '@');
+        if ($at === false || !function_exists('idn_to_utf8')) {
+            return $email;
+        }
+        $domain = substr($email, $at + 1);
+        if (strpos($domain, 'xn--') === false) {
+            return $email;
+        }
+        $unicode = idn_to_utf8($domain, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
+
+        return is_string($unicode) && $unicode !== '' ? substr($email, 0, $at) . '@' . mb_strtolower($unicode) : $email;
+    }
+
+    /**
+     * Alle Schreibweisen einer Adresse, unter denen sie in Zammad stehen kann.
+     *
+     * @return string[]
+     */
+    public static function variants(string $email): array
+    {
+        $variants = [mb_strtolower(trim($email)), self::normalize($email)];
+        $at       = strrpos($variants[1], '@');
+        if ($at !== false && function_exists('idn_to_ascii')) {
+            $ascii = idn_to_ascii(substr($variants[1], $at + 1), IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46);
+            if (is_string($ascii) && $ascii !== '') {
+                $variants[] = substr($variants[1], 0, $at) . '@' . strtolower($ascii);
+            }
+        }
+
+        return array_values(array_unique($variants));
     }
 
     /**

@@ -1,7 +1,8 @@
 ---
 # Webservice fuer znuny2zammad
 # Import: Znuny > Admin > Webservices > Webservice hinzufuegen > "Webservice importieren"
-# oder:   bin/znuny.Console.pl Admin::WebService::Add --name Znuny2Zammad --source-path Znuny2Zammad.yml
+# oder im Znuny-Ordner als Znuny-Benutzer (Datei muss fuer ihn lesbar sein):
+#         bin/znuny.Console.pl Admin::WebService::Add --name Znuny2Zammad --source-path /tmp/Znuny2Zammad.yml
 #         (Znuny 6.x: bin/otrs.Console.pl)
 #
 # DebugThreshold bitte auf "error" lassen: bei "debug" speichert Znuny Passwoerter und

@@ -106,7 +106,8 @@ final class ArticleConverterTest extends TestCase
         $this->assertFalse(isset($payload['to']));
         $this->assertStringContains("[Von: Support <support@firma.example>]\n[An: \"Muster, Max\" <max.muster@acme.example>]", $payload['body']);
         $this->assertStringNotContains('geheim@firma.example', $payload['body'], 'Bcc darf nicht uebernommen werden');
-        $this->assertFalse(isset($payload['preferences']['send-auto-response']));
+        // Auch Agenten-Artikel duerfen keine Kunden-Trigger ausloesen.
+        $this->assertSame(false, $payload['preferences']['send-auto-response']);
     }
 
     public function testSystemArticleIsNote(): void
@@ -238,7 +239,84 @@ final class ArticleConverterTest extends TestCase
         $customer = ArticleConverter::customerFromTicket(['CustomerUserID' => 'Kunde@Example.com'], []);
         $this->assertSame(['email' => 'kunde@example.com', 'firstname' => '', 'lastname' => ''], $customer);
 
+        // Punycode aus Mail-Headern wird wie in Zammad als Unicode gespeichert.
+        $customer = ArticleConverter::customerFromTicket(['CustomerUserID' => 'max@xn--mller-kva.de'], []);
+        $this->assertSame('max@müller.de', $customer['email']);
+
         $this->assertSame(null, ArticleConverter::customerFromTicket(['CustomerUserID' => 'login'], []));
+    }
+
+    public function testOnlyImgSrcReferencesAreEmbedded(): void
+    {
+        $html    = '<table><tr><td background="cid:bg@x">Text</td></tr></table><p><img alt="a" src=\'cid:logo@x\'></p>';
+        $article = $this->htmlArticle($html, [
+            ['Filename' => 'bg.png', 'ContentType' => 'image/png', 'ContentID' => '<bg@x>', 'Disposition' => 'inline', 'FilesizeRaw' => '1', 'Content' => base64_encode('B')],
+            ['Filename' => 'logo.png', 'ContentType' => 'image/png', 'ContentID' => '<logo@x>', 'Disposition' => 'inline', 'FilesizeRaw' => '1', 'Content' => base64_encode('L')],
+        ]);
+        $payload = $this->converter(['article_header' => false])->convert($article, true)['payload'];
+        $this->assertStringContains("src='data:image/png;base64," . base64_encode('L') . "'", $payload['body']);
+        $this->assertStringContains('background="cid:bg@x"', $payload['body']);
+        // Das Hintergrundbild geht nicht verloren, sondern wird normaler Anhang.
+        $this->assertCount(1, $payload['attachments']);
+        $this->assertSame('bg.png', $payload['attachments'][0]['filename']);
+    }
+
+    public function testInlineImagesRespectSizeLimits(): void
+    {
+        $mb      = 1024 * 1024;
+        $html    = '<p><img src="cid:a@x"><img src="cid:b@x"><img src="cid:c@x"></p>';
+        $article = $this->htmlArticle($html, [
+            ['Filename' => 'a.jpg', 'ContentType' => 'image/jpeg', 'ContentID' => '<a@x>', 'Disposition' => 'inline', 'FilesizeRaw' => (string) (25 * $mb), 'Content' => base64_encode('A')],
+            ['Filename' => 'b.jpg', 'ContentType' => 'image/jpeg', 'ContentID' => '<b@x>', 'Disposition' => 'inline', 'FilesizeRaw' => (string) (19 * $mb), 'Content' => base64_encode('B')],
+            ['Filename' => 'c.jpg', 'ContentType' => 'image/jpeg', 'ContentID' => '<c@x>', 'Disposition' => 'inline', 'FilesizeRaw' => (string) (19 * $mb), 'Content' => base64_encode('C')],
+        ]);
+        $payload = $this->converter()->convert($article, true)['payload'];
+        // a: groesser als max_attachment_size (20 MB), c: Summe > 35 MB -> beide ausgelassen und vermerkt.
+        $this->assertStringContains('data:image/jpeg;base64,' . base64_encode('B'), $payload['body']);
+        $this->assertStringNotContains(base64_encode('A') . '"', $payload['body']);
+        $this->assertStringContains('a.jpg (25,0 MB, zu gross)', $payload['body']);
+        $this->assertStringContains('c.jpg (19,0 MB, Gesamtgroesse ueberschritten)', $payload['body']);
+        $this->assertFalse(isset($payload['attachments']));
+    }
+
+    public function testLongRecipientListIsNotTruncated(): void
+    {
+        $to = [];
+        for ($i = 1; $i <= 90; $i++) {
+            $to[] = sprintf('"Mitarbeiter Nummer %d" <mitarbeiter%d@example.com>', $i, $i);
+        }
+        $article = $this->article('101');
+        $article['To'] = implode(', ', $to);
+        $payload = $this->converter()->convert($article, true)['payload'];
+        $this->assertSame('email', $payload['type']);
+        $this->assertSame($article['To'], $payload['to']);
+    }
+
+    /**
+     * @param array<int,array<string,mixed>> $attachments
+     *
+     * @return array<string,mixed>
+     */
+    private function htmlArticle(string $html, array $attachments): array
+    {
+        array_unshift($attachments, [
+            'Filename'    => 'file-2',
+            'ContentType' => 'text/html; charset="utf-8"',
+            'Disposition' => 'inline',
+            'FilesizeRaw' => (string) strlen($html),
+            'Content'     => base64_encode($html),
+        ]);
+
+        return [
+            'ArticleID'            => '1',
+            'SenderType'           => 'customer',
+            'CommunicationChannel' => 'Email',
+            'IsVisibleForCustomer' => '1',
+            'From'                 => 'kunde@example.com',
+            'To'                   => 'support@example.com',
+            'Body'                 => 'Text',
+            'Attachment'           => $attachments,
+        ];
     }
 
     public function testCharsetConversion(): void

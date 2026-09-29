@@ -9,8 +9,9 @@ use Znuny2Zammad\Http\HttpClient;
 /**
  * Zugriff auf die Zammad-REST-API (Authentifizierung per API-Token).
  *
- * Der Token braucht die Berechtigung "ticket.agent", der zugehoerige
- * Benutzer "create"-Rechte in den Zielgruppen.
+ * Der Token braucht die Berechtigung "ticket.agent", der zugehoerige Benutzer
+ * in den Zielgruppen die Rechte Lesen, Erstellen und Aendern (oder Vollzugriff):
+ * nach dem Anlegen werden weitere Artikel hinzugefuegt und das Ticket gelesen.
  */
 final class ZammadClient
 {
@@ -114,14 +115,53 @@ final class ZammadClient
      */
     public function findUserByEmail(string $email): ?array
     {
-        $email = mb_strtolower(trim($email));
-        if ($email === '') {
+        if (trim($email) === '') {
             return null;
         }
+        // Zammad speichert Umlaut-Domains als Unicode, Mail-Header enthalten oft Punycode.
+        $variants = EmailAddress::variants($email);
 
-        return $this->pickUser($this->searchUsers($email), static function (array $user) use ($email): bool {
-            return mb_strtolower(trim((string) ($user['email'] ?? ''))) === $email;
+        return $this->pickUser($this->searchUsers(EmailAddress::normalize($email)), static function (array $user) use ($variants): bool {
+            return in_array(EmailAddress::normalize((string) ($user['email'] ?? '')), $variants, true);
         });
+    }
+
+    /**
+     * IDs der Tickets mit diesem Tag (Datenbanksuche, ohne Elasticsearch-Verzoegerung).
+     *
+     * @return int[]
+     */
+    public function findTicketIdsByTag(string $tag): array
+    {
+        $data = $this->request('POST', '/api/v1/tickets/search', [
+            'condition' => ['ticket.tags' => ['operator' => 'contains all', 'value' => $tag]],
+            'limit'     => 10,
+        ]);
+
+        // Zammad 7: Liste von Tickets; aeltere Versionen: {"tickets": [IDs], ...}
+        $items = [];
+        if (is_array($data)) {
+            $items = $data['tickets'] ?? $data['record_ids'] ?? $data['records'] ?? $data;
+        }
+        $ids = [];
+        foreach ((array) $items as $item) {
+            $id = is_array($item) ? (int) ($item['id'] ?? 0) : (int) $item;
+            if ($id > 0) {
+                $ids[] = $id;
+            }
+        }
+
+        return array_values(array_unique($ids));
+    }
+
+    /**
+     * @return string[]
+     */
+    public function ticketTags(int $ticketId): array
+    {
+        $data = $this->request('GET', '/api/v1/tags?object=Ticket&o_id=' . $ticketId);
+
+        return is_array($data) ? array_map('strval', (array) ($data['tags'] ?? [])) : [];
     }
 
     /**
@@ -131,14 +171,14 @@ final class ZammadClient
      */
     public function findUserByLoginOrEmail(string $loginOrEmail): ?array
     {
-        $value = mb_strtolower(trim($loginOrEmail));
+        $value = EmailAddress::normalize($loginOrEmail);
         if ($value === '') {
             return null;
         }
 
         return $this->pickUser($this->searchUsers($value), static function (array $user) use ($value): bool {
-            return mb_strtolower((string) ($user['login'] ?? '')) === $value
-                || mb_strtolower(trim((string) ($user['email'] ?? ''))) === $value;
+            return EmailAddress::normalize((string) ($user['login'] ?? '')) === $value
+                || EmailAddress::normalize((string) ($user['email'] ?? '')) === $value;
         });
     }
 

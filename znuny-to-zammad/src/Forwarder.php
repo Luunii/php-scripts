@@ -89,6 +89,7 @@ final class Forwarder
             return $result;
         }
 
+        $this->checkMemory($znunyTicketId);
         $ticket   = $this->znuny->getTicket($znunyTicketId);
         $number   = (string) ($ticket['TicketNumber'] ?? $key);
         $forward  = $this->config['forward'];
@@ -161,18 +162,35 @@ final class Forwarder
         }
 
         // Anlegen bzw. abgebrochenen Lauf fortsetzen.
+        if ($entry !== null && empty($entry['zammad_ticket_id'])) {
+            // Der letzte Versuch brach beim Anlegen ab (z. B. Zeitueberschreitung) - vielleicht
+            // hat Zammad das Ticket trotzdem angelegt. Dann dieses Ticket uebernehmen.
+            $entry = $this->adoptInterruptedCreate($key, $number, $entry, (string) $group['name']);
+        }
         $resumed = $entry !== null;
+        $expectedTags = $tags !== '' ? explode(',', $tags) : [];
         if ($resumed) {
             $zammadTicketId = (int) $entry['zammad_ticket_id'];
             $this->logger->info(sprintf('Znuny-Ticket %s: setze abgebrochene Weiterleitung fort (Zammad #%s).', $number, $entry['zammad_ticket_number'] ?? $zammadTicketId));
-            $done = $this->articlesInZammad($zammadTicketId);
+            $existing = $this->articlesInZammad($zammadTicketId);
+            $done     = $existing['articles'];
             foreach ((array) ($entry['articles_done'] ?? []) as $id) {
                 $done[(int) $id] = true;
+            }
+            if ($existing['info_note']) {
+                $entry['info_note_done'] = true;
             }
         } else {
             $first = array_shift($converted);
             $ticketPayload['article'] = $first['payload'];
-            $created = $this->createTicket($ticketPayload, $number);
+
+            // Vor dem Anlegen vermerken: bricht die Anfrage ab, sucht der naechste Lauf erst in Zammad.
+            $this->state->set($key, [
+                'znuny_ticket_number' => $number,
+                'create_started_at'   => date('c'),
+                'complete'            => false,
+            ]);
+            $created = $this->createTicket($ticketPayload, $number, $key);
             $zammadTicketId = (int) $created['id'];
             $entry = [
                 'znuny_ticket_number'  => $number,
@@ -210,15 +228,17 @@ final class Forwarder
                 'subject'      => 'Aus Znuny weitergeleitet: Ticket#' . $number,
                 'body'         => $this->infoNote($ticket, count($articles), count($allArticles)),
                 'content_type' => 'text/html',
-                'preferences'  => ['znuny_info_note' => true],
+                'preferences'  => ['znuny_info_note' => true, 'send-auto-response' => false],
             ], $suppress);
             $entry['info_note_done'] = true;
             $this->state->set($key, $entry);
         }
 
-        // Spaetere Kunden-Artikel koennen den Status in Zammad zuruecksetzen - pruefen.
-        $this->ensureState($zammadTicketId, $zammadState, $pendingTime);
-        foreach ($this->detectAutomaticMails($zammadTicketId) as $warning) {
+        // Abschlusskontrollen: Status, Tags, von Zammad erzeugte E-Mails.
+        $checks = $this->ensureState($zammadTicketId, $zammadState, $pendingTime);
+        $checks = array_merge($checks, $this->checkTags($zammadTicketId, $expectedTags));
+        $checks = array_merge($checks, $this->detectAutomaticMails($zammadTicketId));
+        foreach ($checks as $warning) {
             $warnings[] = $warning;
             $this->logger->warn(sprintf('Znuny-Ticket %s: %s', $number, $warning));
         }
@@ -261,7 +281,7 @@ final class Forwarder
                     $entry['zammad_ticket_number'] ?? '?',
                     $entry['zammad_group'] ?? '?',
                     $url,
-                    date('d.m.Y H:i')
+                    $this->formatTime('now', date_default_timezone_get())
                 );
                 $subject = (string) ($after['note_subject'] ?? 'Ticket an Zammad weitergeleitet');
                 $this->znuny->addInternalNote($znunyTicketId, $subject, $body, !empty($after['no_agent_notify']));
@@ -275,10 +295,9 @@ final class Forwarder
             }
             if (!empty($after['state'])) {
                 $fields['State'] = (string) $after['state'];
-                if (stripos($fields['State'], 'pending') === 0) {
-                    // Znuny verlangt bei Warte-Status eine Zeit (sonst Teil-Update ohne Status).
-                    $fields['PendingTime'] = ['Diff' => (int) ($after['pending_diff_minutes'] ?? 1440)];
-                }
+                // Znuny verlangt bei Status vom Typ "pending*" eine Zeit (sonst Teil-Update:
+                // Queue geaendert, Status nicht). Bei anderen Status wird sie ignoriert.
+                $fields['PendingTime'] = ['Diff' => max(1, (int) ($after['pending_diff_minutes'] ?? 1440))];
             }
             if ($fields !== []) {
                 $this->znuny->updateTicket($znunyTicketId, $fields);
@@ -304,25 +323,136 @@ final class Forwarder
      *
      * @return array<string,mixed>
      */
-    private function createTicket(array $payload, string $number): array
+    private function createTicket(array $payload, string $number, string $key): array
     {
         try {
-            $created = $this->zammad->createTicket($payload);
-        } catch (ApiException $e) {
-            // Besitzer ohne Zugriff auf die Gruppe: ohne Besitzer erneut versuchen.
-            if (isset($payload['owner_id']) && $e->getCode() === 422 && stripos($e->getMessage(), 'owner') !== false) {
-                $this->logger->warn(sprintf('Znuny-Ticket %s: Besitzer in Zammad nicht zulaessig (%s), lege Ticket ohne Besitzer an.', $number, $e->getMessage()));
-                unset($payload['owner_id']);
+            try {
                 $created = $this->zammad->createTicket($payload);
-            } else {
-                throw $e;
+            } catch (ApiException $e) {
+                // Besitzer ohne Zugriff auf die Gruppe: ohne Besitzer erneut versuchen.
+                if (isset($payload['owner_id']) && $e->getCode() === 422 && stripos($e->getMessage(), 'owner') !== false) {
+                    $this->logger->warn(sprintf('Znuny-Ticket %s: Besitzer in Zammad nicht zulaessig (%s), lege Ticket ohne Besitzer an.', $number, $e->getMessage()));
+                    unset($payload['owner_id']);
+                    $created = $this->zammad->createTicket($payload);
+                } else {
+                    throw $e;
+                }
             }
+        } catch (ApiException $e) {
+            // Bei 4xx hat Zammad sicher nichts angelegt: Vermerk wieder entfernen.
+            // Bei Zeitueberschreitung/5xx bleibt er stehen (siehe adoptInterruptedCreate()).
+            if ($e->getCode() >= 400 && $e->getCode() < 500) {
+                $this->state->remove($key);
+            }
+            throw $e;
         }
         if (empty($created['id'])) {
             throw new ApiException('Zammad hat beim Anlegen keine Ticket-ID geliefert.');
         }
 
         return $created;
+    }
+
+    /**
+     * Sucht nach einem abgebrochenen Anlegen das Ticket in Zammad (ueber den Tag znuny-<Nummer>).
+     *
+     * @param array<string,mixed> $entry Vermerk ohne zammad_ticket_id
+     *
+     * @return array<string,mixed>|null Eintrag des gefundenen Tickets oder null (= neu anlegen)
+     */
+    private function adoptInterruptedCreate(string $key, string $number, array $entry, string $groupName): ?array
+    {
+        $since = (string) ($entry['create_started_at'] ?? '?');
+        if (empty($this->config['zammad']['tag_ticket_number'])) {
+            throw new \RuntimeException(sprintf(
+                'Das Anlegen in Zammad wurde am %s unterbrochen. Bitte in Zammad pruefen, ob das Ticket existiert, '
+                . 'und dann mit --force erneut weiterleiten (oder zammad.tag_ticket_number aktivieren).',
+                $since
+            ));
+        }
+
+        $ids = $this->zammad->findTicketIdsByTag('znuny-' . $number);
+        if (count($ids) > 1) {
+            throw new \RuntimeException(sprintf(
+                'In Zammad gibt es mehrere Tickets mit dem Tag znuny-%s (IDs %s). Bitte pruefen und ggf. mit --force erneut weiterleiten.',
+                $number,
+                implode(', ', $ids)
+            ));
+        }
+        if ($ids === []) {
+            $this->logger->info(sprintf('Znuny-Ticket %s: das unterbrochene Anlegen vom %s hat kein Zammad-Ticket hinterlassen, lege neu an.', $number, $since));
+
+            return null;
+        }
+
+        $ticket = $this->zammad->getTicket($ids[0]);
+        $this->logger->info(sprintf('Znuny-Ticket %s: Zammad-Ticket #%s aus dem unterbrochenen Lauf gefunden, setze fort.', $number, $ticket['number'] ?? $ids[0]));
+        $adopted = [
+            'znuny_ticket_number'  => $number,
+            'zammad_ticket_id'     => $ids[0],
+            'zammad_ticket_number' => (string) ($ticket['number'] ?? ''),
+            'zammad_group'         => $groupName,
+            'articles_done'        => [],
+            'info_note_done'       => false,
+            'complete'             => false,
+            'source_updated'       => false,
+            'forwarded_at'         => $since,
+        ];
+        $this->state->set($key, $adopted);
+
+        return $adopted;
+    }
+
+    /**
+     * Schaetzt vorab den Speicherbedarf: Znuny liefert alle Anhaenge in einer Antwort.
+     * So gibt es einen verstaendlichen Fehler fuer dieses Ticket statt eines
+     * PHP-Absturzes (der im Batch-Betrieb jeden weiteren Lauf blockieren wuerde).
+     */
+    private function checkMemory(int $znunyTicketId): void
+    {
+        $limit = self::bytes((string) ini_get('memory_limit'));
+        if ($limit <= 0) {
+            return;
+        }
+        $meta  = $this->znuny->getTicket($znunyTicketId, false);
+        $total = 0;
+        foreach ((array) ($meta['Article'] ?? []) as $article) {
+            foreach ((array) ($article['Attachment'] ?? []) as $attachment) {
+                $total += (int) ($attachment['FilesizeRaw'] ?? 0);
+            }
+        }
+        // Base64 in der Znuny-Antwort, dekodiert, erneut als JSON fuer Zammad: grob Faktor 3.
+        $needed = memory_get_usage() + 3 * $total + 16 * 1024 * 1024;
+        if ($needed > $limit) {
+            throw new \RuntimeException(sprintf(
+                'Ticket zu gross fuer memory_limit %s (Anhaenge %s, benoetigt ca. %s). memory_limit in config.php erhoehen.',
+                ini_get('memory_limit'),
+                ArticleConverter::humanSize($total),
+                ArticleConverter::humanSize($needed)
+            ));
+        }
+    }
+
+    /**
+     * @return int Bytes, 0 = unbegrenzt
+     */
+    public static function bytes(string $value): int
+    {
+        $value = trim($value);
+        if ($value === '' || $value === '-1') {
+            return 0;
+        }
+        $number = (int) $value;
+        switch (strtolower(substr($value, -1))) {
+            case 'g':
+                return $number * 1024 * 1024 * 1024;
+            case 'm':
+                return $number * 1024 * 1024;
+            case 'k':
+                return $number * 1024;
+            default:
+                return $number;
+        }
     }
 
     /**
@@ -403,6 +533,9 @@ final class Forwarder
         if (in_array($zammadState['name'] ?? '', ['merged'], true)) {
             throw new \RuntimeException('Tickets koennen in Zammad nicht im Status "merged" angelegt werden.');
         }
+        if (array_key_exists('active', $zammadState) && !$zammadState['active']) {
+            throw new \RuntimeException(sprintf('Zammad-Status "%s" ist deaktiviert.', $zammadState['name']));
+        }
 
         $pendingTime = null;
         $type        = (string) ($zammadState['state_type'] ?? '');
@@ -428,13 +561,13 @@ final class Forwarder
         $zconf   = $this->config['zammad'];
         $source  = (string) ($ticket['Priority'] ?? '');
         $name    = self::mapValue((array) ($zconf['priority_map'] ?? []), $source) ?? (string) $zconf['default_priority'];
-        $priority = $this->zammad->findPriority($name);
+        $priority = self::activeOnly($this->zammad->findPriority($name));
         if ($priority === null && $name !== (string) $zconf['default_priority']) {
-            $warnings[] = sprintf('Zammad-Prioritaet "%s" nicht gefunden, verwende "%s".', $name, $zconf['default_priority']);
-            $priority = $this->zammad->findPriority((string) $zconf['default_priority']);
+            $warnings[] = sprintf('Zammad-Prioritaet "%s" nicht gefunden oder deaktiviert, verwende "%s".', $name, $zconf['default_priority']);
+            $priority = self::activeOnly($this->zammad->findPriority((string) $zconf['default_priority']));
         }
         if ($priority === null) {
-            throw new \RuntimeException(sprintf('Zammad-Prioritaet "%s" nicht gefunden.', $zconf['default_priority']));
+            throw new \RuntimeException(sprintf('Zammad-Prioritaet "%s" nicht gefunden oder deaktiviert.', $zconf['default_priority']));
         }
 
         return $priority;
@@ -576,35 +709,79 @@ final class Forwarder
     }
 
     /**
-     * Setzt den Zammad-Status erneut, falls ihn ein Kunden-Artikel zurueckgesetzt hat.
+     * Setzt den Zielstatus erneut, falls Zammad ihn geaendert hat: ein oeffentlicher
+     * Agenten-Artikel (z. B. Telefon) setzt ein Ticket im Status "new" auf "open".
      *
      * @param array<string,mixed> $zammadState
+     *
+     * @return string[] Warnungen
      */
-    private function ensureState(int $zammadTicketId, array $zammadState, ?string $pendingTime): void
+    private function ensureState(int $zammadTicketId, array $zammadState, ?string $pendingTime): array
     {
-        $ticket = $this->zammad->getTicket($zammadTicketId);
-        if ((int) ($ticket['state_id'] ?? 0) === (int) $zammadState['id']) {
-            return;
+        try {
+            $ticket = $this->zammad->getTicket($zammadTicketId);
+            if ((int) ($ticket['state_id'] ?? 0) === (int) $zammadState['id']) {
+                return [];
+            }
+            if (($zammadState['state_type'] ?? $zammadState['name']) === 'new') {
+                // "new" kann Zammad bei bestehenden Tickets nicht mehr setzen.
+                return [sprintf('Zammad hat den Status von "%s" auf einen anderen Status geaendert (oeffentlicher Agenten-Artikel); "new" laesst sich nicht wiederherstellen.', $zammadState['name'])];
+            }
+            $payload = ['state_id' => (int) $zammadState['id']];
+            if ($pendingTime !== null) {
+                $payload['pending_time'] = $pendingTime;
+            }
+            $this->zammad->updateTicket($zammadTicketId, $payload);
+        } catch (ApiException $e) {
+            return [sprintf('Status "%s" konnte in Zammad nicht gesetzt werden: %s', $zammadState['name'], $e->getMessage())];
         }
-        $payload = ['state_id' => (int) $zammadState['id']];
-        if ($pendingTime !== null) {
-            $payload['pending_time'] = $pendingTime;
-        }
-        $this->zammad->updateTicket($zammadTicketId, $payload);
+
+        return [];
     }
 
     /**
-     * IDs der Znuny-Artikel, die schon im Zammad-Ticket sind (fuer das Fortsetzen).
+     * Warnt, wenn Tags fehlen (z. B. Zammad-Einstellung "Neue Tags erlauben" aus) -
+     * davon haengen Trigger-Ausnahmen und das Wiederfinden nach Abbruechen ab.
      *
-     * @return array<int,bool>
+     * @param string[] $expected
+     *
+     * @return string[]
+     */
+    private function checkTags(int $zammadTicketId, array $expected): array
+    {
+        if ($expected === []) {
+            return [];
+        }
+        try {
+            $actual = array_map('mb_strtolower', $this->zammad->ticketTags($zammadTicketId));
+        } catch (ApiException $e) {
+            return [];
+        }
+        $missing = array_values(array_filter($expected, static function (string $tag) use ($actual): bool {
+            return !in_array(mb_strtolower($tag), $actual, true);
+        }));
+
+        return $missing === [] ? [] : [sprintf(
+            'Tags fehlen im Zammad-Ticket: %s. Tags in Zammad anlegen oder die Einstellung "Neue Tags" aktivieren (siehe README).',
+            implode(', ', $missing)
+        )];
+    }
+
+    /**
+     * Welche Znuny-Artikel (und ob die Info-Notiz) schon im Zammad-Ticket sind - fuer das Fortsetzen.
+     *
+     * @return array{articles: array<int,bool>, info_note: bool}
      */
     private function articlesInZammad(int $zammadTicketId): array
     {
-        $done = [];
+        $done = ['articles' => [], 'info_note' => false];
         foreach ($this->zammad->ticketArticles($zammadTicketId) as $article) {
             $id = (int) ($article['preferences']['znuny_article_id'] ?? 0);
             if ($id > 0) {
-                $done[$id] = true;
+                $done['articles'][$id] = true;
+            }
+            if (!empty($article['preferences']['znuny_info_note'])) {
+                $done['info_note'] = true;
             }
         }
 
@@ -650,7 +827,7 @@ final class Forwarder
             'Kunde'             => trim(($ticket['CustomerUserID'] ?? '') . ' / ' . ($ticket['CustomerID'] ?? ''), ' /'),
             'Besitzer'          => $ticket['Owner'] ?? '',
             'Verantwortlich'    => $ticket['Responsible'] ?? '',
-            'Erstellt'          => $ticket['Created'] ?? '',
+            'Erstellt'          => isset($ticket['Created']) ? $this->formatTime((string) $ticket['Created'], (string) ($this->config['znuny']['timezone'] ?? 'UTC')) : '',
             'Übernommene Artikel' => $transferred . ' von ' . $total,
         ];
         foreach ((array) ($ticket['DynamicField'] ?? []) as $field) {
@@ -761,6 +938,31 @@ final class Forwarder
         }
 
         return null;
+    }
+
+    /**
+     * @param array<string,mixed>|null $item
+     *
+     * @return array<string,mixed>|null
+     */
+    private static function activeOnly(?array $item): ?array
+    {
+        return $item !== null && (!array_key_exists('active', $item) || $item['active']) ? $item : null;
+    }
+
+    /**
+     * Zeitangabe in der Anzeige-Zeitzone (wie im Artikelkopf).
+     */
+    private function formatTime(string $value, string $sourceTimezone): string
+    {
+        try {
+            $date = new \DateTimeImmutable($value, new \DateTimeZone($sourceTimezone));
+            $zone = new \DateTimeZone((string) ($this->config['forward']['display_timezone'] ?? 'Europe/Berlin'));
+        } catch (\Exception $e) {
+            return $value;
+        }
+
+        return $date->setTimezone($zone)->format('d.m.Y H:i');
     }
 
     private static function e(string $value): string

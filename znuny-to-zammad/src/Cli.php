@@ -88,44 +88,53 @@ final class Cli
             if (!empty($options['no-internal'])) {
                 $config['forward']['include_internal'] = false;
             }
+            $dryRun = !empty($options['dry-run']);
+            if ($batch && !$dryRun) {
+                self::assertBatchLeavesQueue($config, !empty($options['no-source-update']));
+            }
+            if ($config['memory_limit'] !== null) {
+                self::raiseMemoryLimit($config['memory_limit']);
+            }
 
             $level  = !empty($options['verbose']) ? Logger::DEBUG : (!empty($options['quiet']) ? Logger::WARN : Logger::INFO);
-            $logger = new Logger($level, $config['log_file'] ?? null, $this->stdout, $this->stderr);
+            $logger = new Logger($level, $config['log_file'], $this->stdout, $this->stderr);
             $http   = $this->http ?? new CurlHttpClient(
                 (int) $config['http']['timeout'],
                 (bool) $config['http']['verify_ssl'],
-                $config['http']['ca_file'] ?? null
+                $config['http']['ca_file']
             );
             $znuny  = new ZnunyClient($http, $logger, $config['znuny']);
             $zammad = new ZammadClient($http, $logger, (string) $config['zammad']['url'], (string) $config['zammad']['token']);
-        } catch (\RuntimeException $e) {
+        } catch (\RuntimeException | \TypeError $e) {
             fwrite($this->stderr, 'FEHLER: ' . $e->getMessage() . "\n");
 
             return self::EXIT_USAGE;
         }
-        $dryRun = !empty($options['dry-run']);
+        $stateFile = $config['state_file'] ?? dirname(__DIR__) . '/var/state.json';
 
         if (!empty($options['check'])) {
-            return $this->check($znuny, $zammad, $logger, $config);
+            return $this->check($znuny, $zammad, $logger, $config, $stateFile);
         }
 
-        // Parallele Laeufe (z. B. ueberlappende Cronjobs) verhindern.
         $lock = null;
-        if (!$dryRun) {
-            $lock = $this->acquireLock($config, (string) ($options['config'] ?? $this->defaultConfigFile), $logger);
-            if ($lock === false) {
-                return $batch ? self::EXIT_OK : self::EXIT_ERROR;
-            }
-        }
-
         try {
-            $stateFile = $config['state_file'] ?? dirname(__DIR__) . '/var/state.json';
             // Beim Trockenlauf wird die Statusdatei nur gelesen.
-            $state     = new StateStore($stateFile, $dryRun);
+            $state = new StateStore($stateFile, $dryRun);
+            if (!$dryRun) {
+                // Vor der ersten Aenderung in Zammad: ohne speicherbaren Status drohen Duplikate.
+                $state->assertWritable();
+                // Parallele Laeufe (z. B. ueberlappende Cronjobs) verhindern.
+                $lock = $this->acquireLock($config['lock_file'] ?? dirname($stateFile) . '/znuny2zammad.lock');
+                if ($lock === false) {
+                    $logger->warn('Es laeuft bereits eine andere Weiterleitung - Abbruch.');
+
+                    return $batch ? self::EXIT_OK : self::EXIT_ERROR;
+                }
+            }
             $forwarder = new Forwarder($znuny, $zammad, $state, $logger, $config);
 
             $ids = $batch
-                ? $this->batchTicketIds($znuny, $config, $options, $logger)
+                ? $this->batchTicketIds($znuny, $state, $config, $options, $logger)
                 : $this->resolveTicketIds($znuny, $arguments, !empty($options['id']));
 
             $errors = 0;
@@ -166,6 +175,32 @@ final class Cli
     }
 
     /**
+     * Im Batch-Betrieb muss ein weitergeleitetes Ticket die Suche verlassen (Status/Queue),
+     * sonst fuellen erledigte Tickets irgendwann jeden Lauf und neue kommen nie dran.
+     *
+     * @param array<string,mixed> $config
+     */
+    private static function assertBatchLeavesQueue(array $config, bool $noSourceUpdate): void
+    {
+        $after = (array) $config['znuny']['after_forward'];
+        if ($noSourceUpdate) {
+            throw new \RuntimeException('--no-source-update ist im Batch-Betrieb nicht moeglich: weitergeleitete Tickets wuerden in der Queue bleiben.');
+        }
+        if (empty($after['state']) && empty($after['queue'])) {
+            throw new \RuntimeException('Fuer den Batch-Betrieb znuny.after_forward.state (z. B. "closed successful") oder znuny.after_forward.queue setzen, damit weitergeleitete Tickets die Queue verlassen.');
+        }
+    }
+
+    private static function raiseMemoryLimit(string $wanted): void
+    {
+        $current = Forwarder::bytes((string) ini_get('memory_limit'));
+        $target  = Forwarder::bytes($wanted);
+        if ($current !== 0 && ($target === 0 || $target > $current)) {
+            @ini_set('memory_limit', $wanted);
+        }
+    }
+
+    /**
      * @param string[] $arguments
      *
      * @return array<string,int> Anzeige-Name => TicketID
@@ -179,7 +214,7 @@ final class Cli
                 throw new \RuntimeException(sprintf('Ungueltige Ticketnummer "%s".', $argument));
             }
             if ($areIds) {
-                if (!ctype_digit($value)) {
+                if (!preg_match('/^\d+$/', $value)) {
                     throw new \RuntimeException(sprintf('Ungueltige TicketID "%s".', $argument));
                 }
                 $ids['ID ' . $value] = (int) $value;
@@ -196,29 +231,62 @@ final class Cli
     }
 
     /**
+     * Sucht die naechsten Tickets der Batch-Queues. Jede Queue wird einzeln gesucht
+     * (ein falscher Queue-Name laesst in Znuny sonst die ganze Suche leer ausgehen),
+     * bereits vollstaendig erledigte Tickets werden uebersprungen.
+     *
      * @param array<string,mixed> $config
      * @param array<string,mixed> $options
      *
      * @return array<string,int>
      */
-    private function batchTicketIds(ZnunyClient $znuny, array $config, array $options, Logger $logger): array
+    private function batchTicketIds(ZnunyClient $znuny, StateStore $state, array $config, array $options, Logger $logger): array
     {
         $queues = !empty($options['queue']) ? (array) $options['queue'] : (array) $config['batch']['queues'];
         if ($queues === []) {
             throw new \RuntimeException('Keine Queue angegeben (--queue=NAME oder batch.queues in der Konfiguration).');
         }
-        $criteria = [
-            'Queues'  => array_values($queues),
-            'Limit'   => max(1, (int) $config['batch']['limit']),
-            'SortBy'  => 'Age',
-            'OrderBy' => 'Up',
-        ];
-        // Hinweis: StateType "Open"/"Closed" funktioniert im GenericInterface nicht, daher echte Statustypen.
-        if (!empty($config['batch']['state_types'])) {
-            $criteria['StateType'] = array_values((array) $config['batch']['state_types']);
+        $limit  = max(1, (int) $config['batch']['limit']);
+        // Groesseres Suchfenster, damit erledigte Tickets (die noch in der Queue liegen) nicht alles belegen.
+        $window = min(500, $limit + $state->count());
+
+        $found = [];
+        foreach ($queues as $queue) {
+            $criteria = [
+                'Queues'  => [(string) $queue],
+                'Limit'   => $window,
+                'SortBy'  => 'Age',
+                'OrderBy' => 'Up',
+            ];
+            // Hinweis: StateType "Open"/"Closed" funktioniert im GenericInterface nicht, daher echte Statustypen.
+            if (!empty($config['batch']['state_types'])) {
+                $criteria['StateType'] = array_values((array) $config['batch']['state_types']);
+            }
+            $ids = $znuny->searchTicketIds($criteria);
+            if ($ids === []) {
+                $logger->debug(sprintf('Queue "%s": keine Tickets (oder Queue-Name falsch).', $queue));
+            }
+            foreach ($ids as $id) {
+                $found[$id] = true;
+            }
         }
-        $ids = $znuny->searchTicketIds($criteria);
-        $logger->info(sprintf('%d Ticket(s) in Queue(s) %s gefunden.', count($ids), implode(', ', $queues)));
+        $ids = array_keys($found);
+        sort($ids);
+
+        $done = array_values(array_filter($ids, static function (int $id) use ($state): bool {
+            $entry = $state->get((string) $id);
+
+            return $entry !== null && !empty($entry['complete']) && !empty($entry['source_updated']);
+        }));
+        if ($done !== []) {
+            $logger->warn(sprintf(
+                '%d bereits weitergeleitete(s) Ticket(s) liegen noch in der Batch-Queue (IDs %s) - znuny.after_forward pruefen.',
+                count($done),
+                implode(', ', array_slice($done, 0, 10))
+            ));
+        }
+        $ids = array_slice(array_values(array_diff($ids, $done)), 0, $limit);
+        $logger->info(sprintf('%d Ticket(s) in Queue(s) %s zu verarbeiten.', count($ids), implode(', ', $queues)));
 
         $result = [];
         foreach ($ids as $id) {
@@ -231,12 +299,16 @@ final class Cli
     /**
      * @param array<string,mixed> $config
      */
-    private function check(ZnunyClient $znuny, ZammadClient $zammad, Logger $logger, array $config): int
+    private function check(ZnunyClient $znuny, ZammadClient $zammad, Logger $logger, array $config, string $stateFile): int
     {
         $ok = true;
         try {
             $znuny->searchTicketIds(['TicketNumber' => '0', 'Limit' => 1]);
             $logger->info(sprintf('Znuny:  OK (%s, Benutzer %s)', ZnunyClient::buildWebserviceUrl($config['znuny']), $config['znuny']['user']));
+            foreach ((array) $config['batch']['queues'] as $queue) {
+                $count = count($znuny->searchTicketIds(['Queues' => [(string) $queue], 'Limit' => 500]));
+                $logger->info(sprintf('Znuny:  Batch-Queue "%s": %d Ticket(s)%s', $queue, $count, $count === 0 ? ' (leer oder Name falsch - exakt inkl. "Eltern::Kind")' : ''));
+            }
         } catch (\Throwable $e) {
             $ok = false;
             $logger->error('Znuny:  ' . $e->getMessage());
@@ -245,21 +317,33 @@ final class Cli
         try {
             $me = $zammad->me();
             $logger->info(sprintf('Zammad: OK (%s, Benutzer %s)', $config['zammad']['url'], $me['login'] ?? $me['email'] ?? '?'));
-            $group = $zammad->findGroup((string) $config['zammad']['default_group']);
-            if ($group === null) {
-                $ok = false;
-                $logger->error(sprintf('Zammad: Standardgruppe "%s" nicht gefunden.', $config['zammad']['default_group']));
-            } else {
+            $groups = ['Standardgruppe' => (string) $config['zammad']['default_group']];
+            foreach ((array) $config['zammad']['group_map'] as $queue => $groupName) {
+                if ($groupName !== null) {
+                    $groups['Gruppe fuer Queue "' . $queue . '"'] = (string) $groupName;
+                }
+            }
+            foreach ($groups as $label => $groupName) {
+                $group = $zammad->findGroup($groupName);
+                if ($group === null) {
+                    $ok = false;
+                    $logger->error(sprintf('Zammad: %s "%s" nicht gefunden.', $label, $groupName));
+                    continue;
+                }
                 $logger->info(sprintf(
-                    'Zammad: Standardgruppe "%s" gefunden%s.',
+                    'Zammad: %s "%s" gefunden%s.',
+                    $label,
                     $group['name'],
                     empty($group['email_address_id']) ? ' (ohne E-Mail-Adresse: Kunden-E-Mails werden als Notizen uebernommen)' : ''
                 ));
-            }
-            foreach ((array) $config['zammad']['group_map'] as $queue => $groupName) {
-                if ($groupName !== null && $zammad->findGroup((string) $groupName) === null) {
-                    $ok = false;
-                    $logger->error(sprintf('Zammad: Gruppe "%s" (fuer Queue "%s") nicht gefunden.', $groupName, $queue));
+                $access = array_map('strval', (array) ($me['group_ids'][(string) $group['id']] ?? []));
+                if (!in_array('full', $access, true) && array_diff(['read', 'create', 'change'], $access) !== []) {
+                    // Rechte ueber Rollen sind hier nicht enthalten - daher nur Warnung.
+                    $logger->warn(sprintf(
+                        'Zammad: Benutzer hat in "%s" direkt nur die Rechte [%s]; benoetigt werden Lesen, Erstellen und Aendern (oder Voll).',
+                        $group['name'],
+                        implode(', ', $access)
+                    ));
                 }
             }
         } catch (\Throwable $e) {
@@ -267,26 +351,32 @@ final class Cli
             $logger->error('Zammad: ' . $e->getMessage());
         }
 
+        try {
+            (new StateStore($stateFile))->assertWritable();
+            $logger->info(sprintf('Status: %s ist beschreibbar.', $stateFile));
+        } catch (\RuntimeException $e) {
+            $ok = false;
+            $logger->error('Status: ' . $e->getMessage());
+        }
+
         return $ok ? self::EXIT_OK : self::EXIT_ERROR;
     }
 
     /**
-     * @param array<string,mixed> $config
-     *
-     * @return resource|false|null
+     * @return resource|false false = eine andere Weiterleitung laeuft bereits
      */
-    private function acquireLock(array $config, string $configFile, Logger $logger)
+    private function acquireLock(string $file)
     {
-        $file = $config['lock_file'] ?? sys_get_temp_dir() . '/znuny2zammad-' . md5((string) realpath($configFile)) . '.lock';
-        $handle = @fopen((string) $file, 'c');
+        $handle = @fopen($file, 'c');
+        if ($handle === false && is_file($file)) {
+            // Datei eines anderen Benutzers: flock() geht auch lesend.
+            $handle = @fopen($file, 'r');
+        }
         if ($handle === false) {
-            $logger->warn(sprintf('Sperrdatei "%s" kann nicht angelegt werden, fahre ohne Sperre fort.', $file));
-
-            return null;
+            throw new \RuntimeException(sprintf('Sperrdatei "%s" kann nicht angelegt werden (Rechte?). Ohne Sperre drohen doppelte Tickets.', $file));
         }
         if (!flock($handle, LOCK_EX | LOCK_NB)) {
             fclose($handle);
-            $logger->warn('Es laeuft bereits eine andere Weiterleitung - Abbruch.');
 
             return false;
         }
@@ -411,7 +501,7 @@ Optionen:
       --articles=MODUS     all (Standard), first oder last
       --no-internal        Interne Artikel nicht uebernehmen
       --no-attachments     Keine Anhaenge uebernehmen
-      --no-source-update   Znuny-Ticket danach nicht aendern (keine Notiz, kein Status)
+      --no-source-update   Znuny-Ticket diesmal nicht aendern (ein spaeterer Aufruf holt es nach)
   -n, --dry-run            Nur anzeigen, was passieren wuerde
       --force              Erneut weiterleiten, auch wenn schon geschehen
   -v, --verbose            Ausfuehrliche Ausgabe

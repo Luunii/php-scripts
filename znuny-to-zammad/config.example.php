@@ -19,8 +19,10 @@ return [
         // Variante aus development/webservices:  'TicketSearch' => 'GET /Ticket'
         // 'routes' => [],
 
-        // Agent mit Lesezugriff auf die betroffenen Queues ("ro") sowie "rw"/"note",
-        // wenn nach der Weiterleitung eine Notiz geschrieben bzw. Status/Queue geaendert wird.
+        // Agent fuer die Schnittstelle. Rechte auf den betroffenen Queues:
+        //   "ro"  genuegt nur mit --no-source-update (Znuny-Ticket wird nicht angefasst),
+        //   "rw"  fuer Notiz und Status-/Queue-Aenderung ("note" allein reicht dem Webservice nicht),
+        //   zusaetzlich "move_into" auf die Ziel-Queue, wenn after_forward.queue gesetzt ist.
         'user'       => 'zammad-bridge',
         'password'   => 'GEHEIM',
 
@@ -28,17 +30,21 @@ return [
         'timezone'   => 'UTC',
 
         // Was nach erfolgreicher Weiterleitung in Znuny passiert:
+        // Im Batch-Betrieb muss state oder queue gesetzt sein, damit Tickets die Queue verlassen.
         'after_forward' => [
-            'note'         => true,                   // interne Notiz mit Zammad-Ticketnummer und Link
-            'note_subject' => 'Ticket an Zammad weitergeleitet',
-            'state'        => 'closed successful',    // null = Status nicht aendern
-            'queue'        => null,                   // z. B. 'Weitergeleitet'; null = Queue nicht aendern
+            'note'            => true,                // interne Notiz mit Zammad-Ticketnummer und Link
+            'note_subject'    => 'Ticket an Zammad weitergeleitet',
+            'no_agent_notify' => false,               // true = Znuny-Agenten nicht ueber die Notiz benachrichtigen
+            'state'           => 'closed successful', // null = Status nicht aendern
+            'queue'           => null,                // z. B. 'Weitergeleitet'; null = Queue nicht aendern
+            'pending_diff_minutes' => 1440,           // Wartezeit, falls "state" ein Warte-Status ist
         ],
     ],
 
     'zammad' => [
         'url'   => 'https://zammad.example.com',
-        // Profil > Token-Zugang, Berechtigung "ticket.agent".
+        // Profil > Token-Zugriff, Berechtigung "ticket.agent". Der Benutzer braucht in den
+        // Zielgruppen die Rechte Lesen, Erstellen und Aendern (oder Voll).
         'token' => 'ZAMMAD-API-TOKEN',
 
         // Zielgruppe in Zammad, wenn keine Zuordnung passt.
@@ -63,6 +69,7 @@ return [
         // 'priority_map' => ['3 normal' => '2 normal'],
 
         // Znuny-Besitzer (Login) => Zammad-Benutzer (Login oder E-Mail). Leer = Ticket ohne Besitzer.
+        // Der Zammad-Benutzer braucht das Recht "Voll" in der Gruppe, sonst wird ohne Besitzer angelegt.
         'owner_map' => [
             // 'mmustermann' => 'max.mustermann@example.com',
         ],
@@ -74,6 +81,7 @@ return [
 
         // Tags fuer das neue Ticket; zusaetzlich "znuny-<Ticketnummer>", wenn tag_ticket_number = true.
         // Tipp: Den Tag "znuny" in Zammad-Triggern ausschliessen (siehe README).
+        // tag_ticket_number an lassen: darueber findet das Skript ein Ticket nach einem Abbruch wieder.
         'tags'              => ['znuny'],
         'tag_ticket_number' => true,
 
@@ -91,7 +99,7 @@ return [
         'include_internal'     => true,    // interne Znuny-Artikel als interne Notizen uebernehmen
         'include_system'       => true,    // Systemartikel (z. B. Auto-Antworten) uebernehmen
         'keep_customer_emails' => true,    // Kunden-E-Mails als E-Mail-Artikel (sonst Notiz)
-        'customer_auto_reply'  => false,   // Zammad-Trigger duerfen den Kunden anschreiben?
+        'customer_auto_reply'  => false,   // true = Zammad-Trigger duerfen den Kunden anschreiben
         'html_body'            => true,    // HTML-Text inkl. Inline-Bilder uebernehmen
         'attachments'          => true,
         'max_attachment_size'          => 20 * 1024 * 1024, // groessere Anhaenge werden ausgelassen
@@ -109,10 +117,15 @@ return [
         'limit'       => 50,
     ],
 
-    // Merkt sich bereits weitergeleitete Tickets (verhindert Duplikate).
+    // Merkt sich bereits weitergeleitete Tickets (verhindert Duplikate). Muss fuer den Benutzer,
+    // unter dem das Skript laeuft, beschreibbar sein. __DIR__ = Ordner dieser Konfigurationsdatei.
     'state_file' => __DIR__ . '/var/state.json',
+    // Sperrdatei gegen parallele Laeufe; null = znuny2zammad.lock neben der Statusdatei.
+    'lock_file'  => null,
     // Logdatei (zusaetzlich zur Ausgabe), z. B. fuer Cronjobs. null = keine.
     'log_file'   => null,
+    // Znuny liefert alle Anhaenge eines Tickets in einer Antwort; der Wert wird bei Bedarf angehoben.
+    'memory_limit' => '1024M',
 
     'http' => [
         'timeout'    => 120,

@@ -23,17 +23,13 @@ final class CliTest extends TestCase
         $this->stateFile  = $this->tempFile('.json');
         unlink($this->stateFile);
         $this->configFile = $this->tempFile('.php');
-        $config = FakeServers::config([
-            'state_file' => $this->stateFile,
-            'lock_file'  => $this->stateFile . '.lock',
-            'batch'      => ['queues' => ['An Zammad']],
-        ]);
-        file_put_contents($this->configFile, '<?php return ' . var_export($config, true) . ';');
+        $this->writeConfig([]);
     }
 
     public function tearDown(): void
     {
         @unlink($this->stateFile . '.lock');
+        @unlink($this->stateFile . '.writelock');
         parent::tearDown();
     }
 
@@ -116,10 +112,92 @@ final class CliTest extends TestCase
         $this->assertSame(['An Zammad'], FakeHttpClient::body($search[0])['Queues']);
         $this->assertSame(['new', 'open'], FakeHttpClient::body($search[0])['StateType']);
 
-        $this->assertSame(Cli::EXIT_OK, $this->run(['--queue=Andere Queue', '--no-source-update']));
-        $this->assertSame(['Andere Queue'], FakeHttpClient::body($this->servers->http->requestsMatching('POST', '~/Ticket/Search$~')[1])['Queues']);
-        $this->assertCount(1, $this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~'));
-        $this->assertCount(0, $this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'));
+        // Im Batch-Betrieb muessen Tickets die Queue verlassen.
+        $this->assertSame(Cli::EXIT_USAGE, $this->run(['--queue=Andere Queue', '--no-source-update']));
+        $this->assertStringContains('--no-source-update ist im Batch-Betrieb nicht moeglich', $this->output);
+
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--queue=Andere Queue', '--queue=Zweite']));
+        $searches = $this->servers->http->requestsMatching('POST', '~/Ticket/Search$~');
+        $this->assertSame(['Andere Queue'], FakeHttpClient::body($searches[1])['Queues'], 'jede Queue einzeln');
+        $this->assertSame(['Zweite'], FakeHttpClient::body($searches[2])['Queues']);
+        $this->assertCount(1, $this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~'), 'Ticket nur einmal, obwohl in beiden Suchen');
+        $this->assertCount(2, $this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'));
+    }
+
+    public function testBatchRequiresAfterForwardStateOrQueue(): void
+    {
+        $this->writeConfig(['znuny' => ['after_forward' => ['state' => null, 'queue' => null]]]);
+        $this->assertSame(Cli::EXIT_USAGE, $this->run(['--batch']));
+        $this->assertStringContains('znuny.after_forward.state', $this->output);
+        $this->assertCount(0, $this->servers->http->requests);
+        // Trockenlauf ist trotzdem erlaubt.
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch', '--dry-run']));
+    }
+
+    public function testBatchDoesNotStarveOnForwardedTicketsStillInQueue(): void
+    {
+        // Ziel-Status vom Typ "offen": Tickets bleiben nach der Weiterleitung in der Queue.
+        $this->writeConfig(['batch' => ['queues' => ['An Zammad'], 'limit' => 1], 'znuny' => ['after_forward' => ['state' => 'open']]]);
+        $this->servers->addZnunyTicket(4712);
+        $this->servers->addZnunyTicket(4713);
+
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch']));
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch']));
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch', '--quiet']));
+        $this->assertStringContains('bereits weitergeleitete(s) Ticket(s) liegen noch in der Batch-Queue', $this->output);
+
+        $state = json_decode((string) file_get_contents($this->stateFile), true);
+        $this->assertSame(['4711', '4712', '4713'], array_map('strval', array_keys($state)));
+        $this->assertCount(3, $this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~'));
+    }
+
+    public function testUnwritableStateFileStopsBeforeZammad(): void
+    {
+        $this->writeConfig(['state_file' => '/proc/znuny2zammad/state.json']);
+        $this->assertSame(Cli::EXIT_ERROR, $this->run(['2024031210000017']));
+        $this->assertStringContains('kann nicht angelegt werden', $this->output);
+        $this->assertCount(0, $this->servers->http->requestsMatching('POST', '~zammad~'));
+
+        $this->assertSame(Cli::EXIT_ERROR, $this->run(['--check']));
+        $this->assertStringContains('FEHLER: Status:', $this->output);
+    }
+
+    public function testLockFileProblemsFailClosed(): void
+    {
+        $this->writeConfig(['lock_file' => '/proc/gibtsnicht/znuny2zammad.lock']);
+        $this->assertSame(Cli::EXIT_ERROR, $this->run(['2024031210000017']));
+        $this->assertStringContains('Sperrdatei', $this->output);
+        $this->assertCount(0, $this->servers->http->requestsMatching('POST', '~zammad~'));
+    }
+
+    public function testConfigFalseMeansNotSet(): void
+    {
+        $this->writeConfig(['log_file' => false, 'http' => ['ca_file' => false]]);
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--check']));
+        $this->writeConfig(['log_file' => 123]);
+        $this->assertSame(Cli::EXIT_USAGE, $this->run(['--check']));
+        $this->assertStringContains('log_file muss ein Text', $this->output);
+    }
+
+    public function testCheckWarnsAboutMissingGroupRights(): void
+    {
+        $this->servers->groupAccess = ['1' => ['create']];
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--check']));
+        $this->assertStringContains('direkt nur die Rechte [create]', $this->output);
+        $this->assertStringContains('Batch-Queue "An Zammad": 1 Ticket(s)', $this->output);
+    }
+
+    /**
+     * @param array<string,mixed> $override
+     */
+    private function writeConfig(array $override): void
+    {
+        $config = FakeServers::config(\Znuny2Zammad\Config::merge([
+            'state_file' => $this->stateFile,
+            'lock_file'  => $this->stateFile . '.lock',
+            'batch'      => ['queues' => ['An Zammad']],
+        ], $override));
+        file_put_contents($this->configFile, '<?php return ' . var_export($config, true) . ';');
     }
 
     public function testUsageErrors(): void

@@ -120,10 +120,12 @@ final class ArticleConverter
         ];
         if ($type === 'email') {
             // Nur bei Kunden-E-Mails speichert Zammad die Adressen unveraendert.
+            // "to" nicht kuerzen: Zammad prueft die Empfaenger vor dem eigenen Kuerzen auf 3000 Zeichen,
+            // eine mitten in einer Adresse abgeschnittene Liste wuerde abgelehnt.
             $payload['from'] = self::limit(self::header($article, 'From'), 3000);
-            $payload['to']   = self::limit($to, 3000);
+            $payload['to']   = $to;
             if ($cc !== '') {
-                $payload['cc'] = self::limit($cc, 3000);
+                $payload['cc'] = $cc;
             }
             $replyTo = self::header($article, 'ReplyTo');
             if ($replyTo !== '') {
@@ -143,7 +145,8 @@ final class ArticleConverter
         }
 
         $preferences = ['znuny_article_id' => (int) ($article['ArticleID'] ?? 0)];
-        if ($sender === 'customer' && empty($this->options['customer_auto_reply'])) {
+        if (empty($this->options['customer_auto_reply'])) {
+            // Zammad-Trigger an Kunde/letzten Absender fuer diesen Artikel unterdruecken.
             // Muss ein echtes JSON-false sein (Zammad vergleicht "== false").
             $preferences['send-auto-response'] = false;
         }
@@ -163,7 +166,7 @@ final class ArticleConverter
     public static function customerFromTicket(array $ticket, array $articles): ?array
     {
         $customerUser = trim((string) ($ticket['CustomerUserID'] ?? ''));
-        $email        = EmailAddress::isValid($customerUser) ? mb_strtolower($customerUser) : '';
+        $email        = EmailAddress::isValid($customerUser) ? EmailAddress::normalize($customerUser) : '';
         $name         = '';
 
         foreach ($articles as $article) {
@@ -286,9 +289,9 @@ final class ArticleConverter
         if ($htmlIndex !== null && ($this->options['html_body'] ?? true)) {
             $html = self::decodeHtml($attachments[$htmlIndex]);
             if ($html !== null && trim(strip_tags($html, '<img>')) !== '') {
-                // 1. Versuch: Inline-Bilder einbetten.
+                // 1. Versuch: Inline-Bilder einbetten (im Rahmen der Groessengrenzen).
                 $used     = [$htmlIndex];
-                $embedded = self::embedInlineImages($html, $attachments, $used);
+                $embedded = $this->embedInlineImages($html, $attachments, $used);
                 if (self::zammadBodyLength($embedded) <= self::BODY_LIMIT) {
                     return ['body' => $embedded, 'content_type' => 'text/html', 'used' => $used];
                 }
@@ -360,12 +363,15 @@ final class ArticleConverter
     }
 
     /**
-     * Ersetzt cid:-Verweise durch data:-URIs (Zammad macht daraus Inline-Anhaenge).
+     * Ersetzt cid:-Verweise in <img src> durch data:-URIs (Zammad macht daraus Inline-Anhaenge).
+     * Andere Verweise (z. B. background="cid:...") entfernt Zammad ohnehin; diese Bilder
+     * bleiben normale Anhaenge. Bilder ueber den Groessengrenzen werden nicht eingebettet und
+     * dann von buildAttachments() ausgelassen und im Artikel vermerkt.
      *
      * @param array<int,array<string,mixed>> $attachments
      * @param int[]                          $used Indizes der verbrauchten Anhaenge (wird ergaenzt)
      */
-    private static function embedInlineImages(string $html, array $attachments, array &$used): string
+    private function embedInlineImages(string $html, array $attachments, array &$used): string
     {
         $byCid = [];
         foreach ($attachments as $index => $attachment) {
@@ -378,10 +384,14 @@ final class ArticleConverter
             return $html;
         }
 
+        $maxSize  = (int) ($this->options['max_attachment_size'] ?? 0);
+        $maxTotal = (int) ($this->options['max_article_attachments_size'] ?? 0);
+        $total    = 0;
+
         return (string) preg_replace_callback(
-            '/(["\'])cid:([^"\']+)\1/i',
-            static function (array $m) use ($attachments, $byCid, &$used): string {
-                $key = mb_strtolower(rawurldecode(trim($m[2])));
+            '~(<img\b[^>]*?\bsrc\s*=\s*)(["\'])cid:([^"\']+)\2~i',
+            static function (array $m) use ($attachments, $byCid, &$used, &$total, $maxSize, $maxTotal): string {
+                $key = mb_strtolower(rawurldecode(trim($m[3])));
                 if (!isset($byCid[$key])) {
                     return $m[0];
                 }
@@ -395,15 +405,20 @@ final class ArticleConverter
                 if ($mime === 'image/jpg') {
                     $mime = 'image/jpeg';
                 }
+                $size = self::size($attachment);
                 $convertible = in_array($mime, self::ZAMMAD_INLINE_TYPES, true);
-                if (!$convertible && self::size($attachment) > self::MAX_EMBEDDED_OTHER_IMAGE) {
+                if (!$convertible && $size > self::MAX_EMBEDDED_OTHER_IMAGE) {
                     return $m[0];
                 }
                 if (!in_array($index, $used, true)) {
+                    if (($maxSize > 0 && $size > $maxSize) || ($maxTotal > 0 && $total + $size > $maxTotal)) {
+                        return $m[0];
+                    }
+                    $total += $size;
                     $used[] = $index;
                 }
 
-                return $m[1] . 'data:' . $mime . ';base64,' . $content . $m[1];
+                return $m[1] . $m[2] . 'data:' . $mime . ';base64,' . $content . $m[2];
             },
             $html
         );

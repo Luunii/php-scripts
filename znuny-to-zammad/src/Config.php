@@ -79,10 +79,11 @@ final class Config
                 'state_types' => ['new', 'open'],
                 'limit'       => 50,
             ],
-            'state_file' => null,
-            'lock_file'  => null,
-            'log_file'   => null,
-            'http'       => [
+            'state_file'   => null,
+            'lock_file'    => null,
+            'log_file'     => null,
+            'memory_limit' => '1024M',
+            'http'         => [
                 'timeout'    => 120,
                 'verify_ssl' => true,
                 'ca_file'    => null,
@@ -101,12 +102,23 @@ final class Config
                 $file
             ));
         }
+        if (!is_readable($file)) {
+            throw new \RuntimeException(sprintf(
+                'Konfigurationsdatei "%s" ist nicht lesbar. Das Skript muss unter dem Benutzer laufen, dem config.php gehoert.',
+                $file
+            ));
+        }
         $config = require $file;
         if (!is_array($config)) {
             throw new \RuntimeException(sprintf('Die Konfigurationsdatei "%s" muss ein Array zurueckgeben.', $file));
         }
 
         $config = self::merge(self::defaults(), $config);
+        // false/'' bei optionalen Pfaden bedeutet "nicht gesetzt".
+        foreach (['state_file', 'lock_file', 'log_file', 'memory_limit'] as $key) {
+            $config[$key] = self::optionalString($config[$key], $key);
+        }
+        $config['http']['ca_file'] = self::optionalString($config['http']['ca_file'], 'http.ca_file');
         self::validate($config);
 
         return $config;
@@ -176,6 +188,21 @@ final class Config
                 throw new \RuntimeException(sprintf('%s: unbekannte Zeitzone "%s".', $key, $timezone));
             }
         }
+    }
+
+    /**
+     * @param mixed $value
+     */
+    private static function optionalString($value, string $key): ?string
+    {
+        if ($value === null || $value === false || $value === '') {
+            return null;
+        }
+        if (!is_string($value)) {
+            throw new \RuntimeException(sprintf('%s muss ein Text (Pfad) oder null sein.', $key));
+        }
+
+        return $value;
     }
 
     /**

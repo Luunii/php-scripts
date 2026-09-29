@@ -94,7 +94,7 @@ final class ZnunyClient
      *
      * @return array<string,mixed>
      */
-    public function getTicket(int $ticketId): array
+    public function getTicket(int $ticketId, bool $withAttachmentContents = true): array
     {
         $params = [
             'AllArticles'          => 1,
@@ -102,6 +102,10 @@ final class ZnunyClient
             'DynamicFields'        => 1,
             'HTMLBodyAsAttachment' => 1,
         ];
+        if (!$withAttachmentContents) {
+            // Liefert trotzdem FilesizeRaw - fuer die Speicherabschaetzung.
+            $params['GetAttachmentContents'] = 0;
+        }
 
         $data = $this->call('TicketGet', ['TicketID' => $ticketId], $params);
         if (!isset($data['Ticket'][0]) || !is_array($data['Ticket'][0])) {
@@ -116,7 +120,8 @@ final class ZnunyClient
      */
     public function findTicketIdByNumber(string $ticketNumber): ?int
     {
-        $ids = $this->searchTicketIds(['TicketNumber' => $ticketNumber, 'Limit' => 2]);
+        // SearchInArchive: auch archivierte Tickets finden (ohne Archivsystem wirkungslos).
+        $ids = $this->searchTicketIds(['TicketNumber' => $ticketNumber, 'SearchInArchive' => 'AllTickets', 'Limit' => 2]);
         if ($ids === []) {
             return null;
         }
