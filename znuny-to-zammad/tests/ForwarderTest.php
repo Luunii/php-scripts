@@ -127,7 +127,10 @@ final class ForwarderTest extends TestCase
         $result = $this->forwarder()->forward(4711);
         $this->assertSame('skipped', $result['status']);
         $this->assertSame('31001', $result['zammad_ticket_number']);
-        $this->assertCount($requests, $this->servers->http->requests, 'keine weiteren Anfragen');
+        // Nur in Znuny nachgesehen, ob neue Artikel da sind - sonst nichts.
+        foreach (array_slice($this->servers->http->requests, $requests) as $request) {
+            $this->assertTrue(strpos($request['url'], FakeServers::ZNUNY) === 0 && $request['method'] !== 'PATCH', $request['method'] . ' ' . $request['url']);
+        }
 
         $result = $this->forwarder()->forward(4711, ['force' => true]);
         $this->assertSame('forwarded', $result['status']);
@@ -458,6 +461,132 @@ final class ForwarderTest extends TestCase
         $this->forwarder()->forward(4711);
         $ticket = FakeHttpClient::body($this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~')[0]);
         $this->assertSame(12, $ticket['customer_id']);
+    }
+
+    public function testFollowUpArticlesAreAppendedToExistingTicket(): void
+    {
+        $this->forwarder()->forward(4711);
+        $this->servers->tickets[55]['state_id'] = 4; // in Zammad inzwischen geschlossen
+
+        // Kundenantwort in Znuny (oeffnet das Ticket dort wieder) und unsere eigene Notiz (ArticleID 900).
+        $this->servers->znunyTicket['Article'][] = [
+            'ArticleID' => '110', 'SenderType' => 'customer', 'CommunicationChannel' => 'Email', 'IsVisibleForCustomer' => '1',
+            'From' => 'max.muster@acme.example', 'To' => 'support@firma.example', 'Subject' => 'Re: Drucker', 'Body' => 'Geht wieder nicht.',
+            'CreateTime' => '2024-03-20 08:00:00',
+        ];
+        $this->servers->znunyTicket['Article'][] = [
+            'ArticleID' => '900', 'SenderType' => 'agent', 'CommunicationChannel' => 'Internal', 'IsVisibleForCustomer' => '0',
+            'Subject' => 'Ticket an Zammad weitergeleitet', 'Body' => 'Dieses Ticket wurde an Zammad weitergeleitet.', 'CreateTime' => '2024-03-14 08:00:00',
+        ];
+        $patches = count($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'));
+
+        $result = $this->forwarder()->forward(4711);
+        $this->assertSame('followup', $result['status']);
+        $this->assertSame(1, $result['articles']);
+        $this->assertCount(1, $this->servers->tickets, 'kein neues Zammad-Ticket');
+        $last = $this->servers->sentArticles()[count($this->servers->sentArticles()) - 1];
+        $this->assertSame(110, $last['preferences']['znuny_article_id']);
+        $this->assertSame('email', $last['type']);
+        $this->assertSame(2, $this->servers->tickets[55]['state_id'], 'geschlossenes Zammad-Ticket wieder geoeffnet');
+
+        $updates = array_slice($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'), $patches);
+        $this->assertCount(2, $updates);
+        $this->assertStringContains('Nachtrag: 1 neue(r) Artikel', FakeHttpClient::body($updates[0])['Article']['Body']);
+        $this->assertSame('closed successful', FakeHttpClient::body($updates[1])['Ticket']['State']);
+
+        // Dritter Lauf: nichts Neues mehr.
+        $this->assertSame('skipped', $this->forwarder()->forward(4711)['status']);
+        $this->assertCount(1, $this->servers->tickets);
+    }
+
+    public function testReapplyAfterForwardWithoutNewArticles(): void
+    {
+        $this->forwarder()->forward(4711);
+        $patches = count($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'));
+        $result = $this->forwarder()->forward(4711, ['reapply_after_forward' => true]);
+        $this->assertSame('source-updated', $result['status']);
+        $updates = array_slice($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'), $patches);
+        $this->assertCount(1, $updates, 'nur Status, keine weitere Notiz');
+        $this->assertTrue(isset(FakeHttpClient::body($updates[0])['Ticket']));
+    }
+
+    public function testRejectedForceKeepsEarlierForward(): void
+    {
+        $this->forwarder()->forward(4711);
+        $this->servers->ticketCreateHandler = function () {
+            $this->servers->ticketCreateHandler = null;
+
+            return FakeServers::error(422, 'Invalid value');
+        };
+        $this->assertThrows(ApiException::class, function (): void {
+            $this->forwarder()->forward(4711, ['force' => true]);
+        }, '422');
+        $this->assertSame(55, $this->state()['zammad_ticket_id'], 'fruehere Weiterleitung wiederhergestellt');
+        $this->assertTrue($this->state()['complete']);
+        $this->assertSame('skipped', $this->forwarder()->forward(4711)['status']);
+        $this->assertCount(1, $this->servers->tickets);
+    }
+
+    public function testInterruptedForceDoesNotAdoptEarlierTicket(): void
+    {
+        $this->forwarder()->forward(4711);
+        $this->servers->ticketCreateHandler = function () {
+            $this->servers->ticketCreateHandler = null;
+
+            return FakeServers::error(504, 'Gateway Timeout'); // nichts angelegt
+        };
+        try {
+            $this->forwarder()->forward(4711, ['force' => true]);
+        } catch (ApiException $e) {
+        }
+        $this->assertSame([55], $this->state()['exclude_ticket_ids']);
+
+        $result = $this->forwarder()->forward(4711);
+        $this->assertSame('forwarded', $result['status'], 'neues Ticket statt das alte zu uebernehmen');
+        $this->assertCount(2, $this->servers->tickets);
+        $this->assertSame([55], $this->state()['earlier_zammad_ticket_ids']);
+        $this->assertSame(4, count(array_filter($this->servers->sentArticles(), static function (array $a): bool {
+            return $a['ticket_id'] === 55 && ($a['preferences']['znuny_article_id'] ?? 0) >= 102;
+        })), 'altes Ticket unveraendert');
+    }
+
+    public function testMissingNumberTagBlocksBlindRecreate(): void
+    {
+        // Zammad verwirft Tags (Einstellung "Neue Tags" aus).
+        $this->servers->ticketCreateHandler = function (array $request) {
+            $body = FakeHttpClient::body($request);
+            unset($body['tags']);
+
+            return FakeHttpClient::json($this->servers->storeTicket($body), 201);
+        };
+        $this->forwarder()->forward(4711);
+
+        $this->servers->addZnunyTicket(4712);
+        $this->servers->ticketCreateHandler = function (array $request) {
+            $body = FakeHttpClient::body($request);
+            unset($body['tags']);
+            $this->servers->storeTicket($body);
+
+            return FakeServers::error(504, 'Gateway Timeout'); // angelegt, Antwort verloren
+        };
+        try {
+            $this->forwarder()->forward(4712);
+        } catch (ApiException $e) {
+        }
+        $this->servers->ticketCreateHandler = null;
+        $this->assertThrows(\RuntimeException::class, function (): void {
+            $this->forwarder()->forward(4712);
+        }, '"Neue Tags"');
+        $this->assertCount(2, $this->servers->tickets, 'kein drittes Ticket');
+    }
+
+    public function testCustomerStoredWithPunycodeIsFound(): void
+    {
+        $this->servers->znunyTicket['CustomerUserID'] = 'max@müller.de';
+        $this->servers->users = [['id' => 13, 'email' => 'max@xn--mller-kva.de', 'active' => true]];
+        $this->forwarder()->forward(4711);
+        $ticket = FakeHttpClient::body($this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~')[0]);
+        $this->assertSame(13, $ticket['customer_id']);
     }
 
     public function testMapValue(): void

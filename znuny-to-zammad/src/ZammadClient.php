@@ -86,11 +86,21 @@ final class ZammadClient
      */
     public function findState(string $name): ?array
     {
-        if ($this->states === null) {
-            $this->states = $this->listAll('/api/v1/ticket_states', ['expand' => 'true']);
+        return self::findByName($this->states(), $name);
+    }
+
+    /**
+     * @return array<string,mixed>|null inkl. "state_type"
+     */
+    public function findStateById(int $id): ?array
+    {
+        foreach ($this->states() as $state) {
+            if ((int) ($state['id'] ?? 0) === $id) {
+                return $state;
+            }
         }
 
-        return self::findByName($this->states, $name);
+        return null;
     }
 
     /**
@@ -118,12 +128,22 @@ final class ZammadClient
         if (trim($email) === '') {
             return null;
         }
-        // Zammad speichert Umlaut-Domains als Unicode, Mail-Header enthalten oft Punycode.
+        // Zammad speichert Umlaut-Domains normalerweise als Unicode, importierte Benutzer
+        // aber evtl. als Punycode - daher jede Schreibweise suchen.
         $variants = EmailAddress::variants($email);
+        $matches  = static function (array $user) use ($variants): bool {
+            $stored = mb_strtolower(trim((string) ($user['email'] ?? '')));
 
-        return $this->pickUser($this->searchUsers(EmailAddress::normalize($email)), static function (array $user) use ($variants): bool {
-            return in_array(EmailAddress::normalize((string) ($user['email'] ?? '')), $variants, true);
-        });
+            return in_array($stored, $variants, true) || in_array(EmailAddress::normalize($stored), $variants, true);
+        };
+        foreach ($variants as $query) {
+            $user = $this->pickUser($this->searchUsers($query), $matches);
+            if ($user !== null) {
+                return $user;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -235,6 +255,18 @@ final class ZammadClient
         $data = $this->request('GET', '/api/v1/ticket_articles/by_ticket/' . $ticketId);
 
         return is_array($data) ? array_values($data) : [];
+    }
+
+    /**
+     * @return array<int,array<string,mixed>>
+     */
+    private function states(): array
+    {
+        if ($this->states === null) {
+            $this->states = $this->listAll('/api/v1/ticket_states', ['expand' => 'true']);
+        }
+
+        return $this->states;
     }
 
     /**

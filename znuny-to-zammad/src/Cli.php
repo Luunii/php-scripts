@@ -89,8 +89,13 @@ final class Cli
                 $config['forward']['include_internal'] = false;
             }
             $dryRun = !empty($options['dry-run']);
-            if ($batch && !$dryRun) {
-                self::assertBatchLeavesQueue($config, !empty($options['no-source-update']));
+            if ($batch) {
+                if (empty($options['queue']) && (array) $config['batch']['queues'] === []) {
+                    throw new \RuntimeException('Keine Queue angegeben (--queue=NAME oder batch.queues in der Konfiguration).');
+                }
+                if (!$dryRun) {
+                    self::assertBatchLeavesQueue($config, !empty($options['no-source-update']));
+                }
             }
             if ($config['memory_limit'] !== null) {
                 self::raiseMemoryLimit($config['memory_limit']);
@@ -118,11 +123,9 @@ final class Cli
 
         $lock = null;
         try {
-            // Beim Trockenlauf wird die Statusdatei nur gelesen.
-            $state = new StateStore($stateFile, $dryRun);
             if (!$dryRun) {
                 // Vor der ersten Aenderung in Zammad: ohne speicherbaren Status drohen Duplikate.
-                $state->assertWritable();
+                (new StateStore($stateFile))->assertWritable();
                 // Parallele Laeufe (z. B. ueberlappende Cronjobs) verhindern.
                 $lock = $this->acquireLock($config['lock_file'] ?? dirname($stateFile) . '/znuny2zammad.lock');
                 if ($lock === false) {
@@ -131,6 +134,8 @@ final class Cli
                     return $batch ? self::EXIT_OK : self::EXIT_ERROR;
                 }
             }
+            // Erst unter der Sperre einlesen (Trockenlauf: nur lesen).
+            $state = new StateStore($stateFile, $dryRun);
             $forwarder = new Forwarder($znuny, $zammad, $state, $logger, $config);
 
             $ids = $batch
@@ -146,6 +151,8 @@ final class Cli
                         'group'         => $options['group'] ?? null,
                         'customer'      => $options['customer'] ?? null,
                         'update_source' => empty($options['no-source-update']),
+                        // Liegt ein weitergeleitetes Ticket wieder in der Batch-Queue, Status/Queue erneut setzen.
+                        'reapply_after_forward' => $batch,
                     ]);
                     $this->report($logger, $result);
                     if (!empty($result['source_update_failed'])) {
@@ -232,8 +239,9 @@ final class Cli
 
     /**
      * Sucht die naechsten Tickets der Batch-Queues. Jede Queue wird einzeln gesucht
-     * (ein falscher Queue-Name laesst in Znuny sonst die ganze Suche leer ausgehen),
-     * bereits vollstaendig erledigte Tickets werden uebersprungen.
+     * (ein falscher Queue-Name laesst in Znuny sonst die ganze Suche leer ausgehen).
+     * Bereits weitergeleitete Tickets, die wieder in der Queue liegen (z. B. nach einer
+     * Kundenantwort), werden immer verarbeitet (Nachtrag) und zaehlen nicht gegen batch.limit.
      *
      * @param array<string,mixed> $config
      * @param array<string,mixed> $options
@@ -243,12 +251,8 @@ final class Cli
     private function batchTicketIds(ZnunyClient $znuny, StateStore $state, array $config, array $options, Logger $logger): array
     {
         $queues = !empty($options['queue']) ? (array) $options['queue'] : (array) $config['batch']['queues'];
-        if ($queues === []) {
-            throw new \RuntimeException('Keine Queue angegeben (--queue=NAME oder batch.queues in der Konfiguration).');
-        }
         $limit  = max(1, (int) $config['batch']['limit']);
-        // Groesseres Suchfenster, damit erledigte Tickets (die noch in der Queue liegen) nicht alles belegen.
-        $window = min(500, $limit + $state->count());
+        $window = min(10000, $limit + $state->count());
 
         $found = [];
         foreach ($queues as $queue) {
@@ -273,19 +277,20 @@ final class Cli
         $ids = array_keys($found);
         sort($ids);
 
-        $done = array_values(array_filter($ids, static function (int $id) use ($state): bool {
+        $known = [];
+        $new   = [];
+        foreach ($ids as $id) {
             $entry = $state->get((string) $id);
-
-            return $entry !== null && !empty($entry['complete']) && !empty($entry['source_updated']);
-        }));
-        if ($done !== []) {
-            $logger->warn(sprintf(
-                '%d bereits weitergeleitete(s) Ticket(s) liegen noch in der Batch-Queue (IDs %s) - znuny.after_forward pruefen.',
-                count($done),
-                implode(', ', array_slice($done, 0, 10))
-            ));
+            if ($entry !== null && !empty($entry['complete'])) {
+                $known[] = $id;
+            } else {
+                $new[] = $id;
+            }
         }
-        $ids = array_slice(array_values(array_diff($ids, $done)), 0, $limit);
+        if ($known !== []) {
+            $logger->info(sprintf('%d bereits weitergeleitete(s) Ticket(s) wieder in der Batch-Queue - Nachtraege werden uebertragen.', count($known)));
+        }
+        $ids = array_merge($known, array_slice($new, 0, $limit));
         $logger->info(sprintf('%d Ticket(s) in Queue(s) %s zu verarbeiten.', count($ids), implode(', ', $queues)));
 
         $result = [];
@@ -354,9 +359,23 @@ final class Cli
         try {
             (new StateStore($stateFile))->assertWritable();
             $logger->info(sprintf('Status: %s ist beschreibbar.', $stateFile));
+            $lockFile = $config['lock_file'] ?? dirname($stateFile) . '/znuny2zammad.lock';
+            $lock     = $this->acquireLock($lockFile);
+            if (is_resource($lock)) {
+                flock($lock, LOCK_UN);
+                fclose($lock);
+            }
         } catch (\RuntimeException $e) {
             $ok = false;
             $logger->error('Status: ' . $e->getMessage());
+        }
+        if ((array) $config['batch']['queues'] !== []) {
+            try {
+                self::assertBatchLeavesQueue($config, false);
+            } catch (\RuntimeException $e) {
+                $ok = false;
+                $logger->error('Batch: ' . $e->getMessage());
+            }
         }
 
         return $ok ? self::EXIT_OK : self::EXIT_ERROR;
@@ -375,10 +394,12 @@ final class Cli
         if ($handle === false) {
             throw new \RuntimeException(sprintf('Sperrdatei "%s" kann nicht angelegt werden (Rechte?). Ohne Sperre drohen doppelte Tickets.', $file));
         }
-        if (!flock($handle, LOCK_EX | LOCK_NB)) {
+        if (!flock($handle, LOCK_EX | LOCK_NB, $wouldBlock)) {
             fclose($handle);
-
-            return false;
+            if ($wouldBlock) {
+                return false;
+            }
+            throw new \RuntimeException(sprintf('Sperrdatei "%s" kann nicht gesperrt werden (Dateisystem ohne Sperren?).', $file));
         }
 
         return $handle;
@@ -488,6 +509,7 @@ znuny2zammad - Tickets von Znuny an Zammad weiterleiten
 
 Aufruf:
   php bin/znuny2zammad.php [Optionen] <Ticketnummer> [<Ticketnummer> ...]
+                                     (schon weitergeleitet: neue Artikel werden als Nachtrag angehaengt)
   php bin/znuny2zammad.php [Optionen] --queue="An Zammad"   (alle Tickets einer Queue, z. B. per Cron)
   php bin/znuny2zammad.php --check                          (Verbindungen testen)
 
@@ -503,7 +525,7 @@ Optionen:
       --no-attachments     Keine Anhaenge uebernehmen
       --no-source-update   Znuny-Ticket diesmal nicht aendern (ein spaeterer Aufruf holt es nach)
   -n, --dry-run            Nur anzeigen, was passieren wuerde
-      --force              Erneut weiterleiten, auch wenn schon geschehen
+      --force              Als neues Zammad-Ticket weiterleiten, auch wenn schon geschehen
   -v, --verbose            Ausfuehrliche Ausgabe
   -q, --quiet              Nur Warnungen und Fehler ausgeben
   -h, --help               Diese Hilfe

@@ -91,9 +91,11 @@ Außerdem wird ein Agent gebraucht, z. B. `zammad-bridge`, mit folgenden Rechten
   Standard-Eingangsbestätigung *auto reply (on new tickets)*. Trigger mit anderen Empfängern (feste
   Adressen, Webhooks, SMS) laufen trotzdem. Deshalb am besten in allen Triggern, die nach außen wirken,
   die Bedingung *Ticket → Tags → enthält eins nicht → `znuny`* ergänzen.
-* **Tags:** Ist in Zammad die Einstellung *Neue Tags* (*Admin → Verwalten → Tags*) ausgeschaltet, den
-  Tag `znuny` dort vorher anlegen. Sonst fehlen die Tags und damit auch die Trigger-Ausnahme. Das Skript
-  warnt in diesem Fall.
+* **Tags:** Ist in Zammad die Einstellung *Neue Tags* (*Admin → Verwalten → Tags*) ausgeschaltet, braucht
+  der API-Benutzer die Berechtigung `admin.tag`. Den Tag `znuny` vorher anzulegen reicht nicht, denn
+  `znuny-<Nummer>` ist pro Ticket neu. Fehlen die Tags, fehlt auch die Trigger-Ausnahme, und nach einem
+  abgebrochenen Anlegen kann das Skript das Ticket nicht wiederfinden. Es warnt dann und verlangt eine
+  manuelle Prüfung.
 * Kunden-E-Mails bleiben in Zammad nur dann echte E-Mail-Artikel (mit „Antworten“-Knopf), wenn die
   Zielgruppe eine E-Mail-Adresse hat. Ohne Adresse werden sie als Notiz übernommen.
 
@@ -167,6 +169,9 @@ Tickets dorthin, ein Cronjob leitet sie weiter und schließt sie in Znuny.
 
 * Weitergeleitete Tickets müssen die Batch-Suche verlassen. Deshalb verlangt `--batch` einen Zielstatus
   oder eine Ziel-Queue in `after_forward`; `--no-source-update` ist im Batch-Betrieb nicht erlaubt.
+* Antwortet der Kunde auf ein weitergeleitetes Ticket, öffnet Znuny es wieder, und es liegt erneut in der
+  Batch-Queue. Der nächste Lauf hängt die neuen Artikel an das bestehende Zammad-Ticket an (siehe
+  *Nachträge*) und schließt das Znuny-Ticket wieder.
 * Jede Queue wird einzeln durchsucht. Ein falscher Queue-Name blockiert also nicht die anderen
   (`--check` zeigt leere Queues an).
 * Pro Lauf werden höchstens `batch.limit` Tickets verarbeitet, die ältesten zuerst.
@@ -211,18 +216,36 @@ Zeitstempel nicht setzen.
   Cronjob anhalten, bis `config.php` angepasst ist, sonst sperrt Znuny den Agenten nach einigen Läufen
   (*PasswordMaxLoginFailed*).
 
+## Nachträge
+
+Wird ein Ticket ein zweites Mal weitergeleitet (von Hand oder im Batch-Betrieb), legt das Skript kein
+weiteres Zammad-Ticket an. Stattdessen:
+
+* Neue Znuny-Artikel seit der Weiterleitung (z. B. eine Kundenantwort) werden an das bestehende
+  Zammad-Ticket angehängt. Die eigenen „weitergeleitet“-Notizen des Skripts sind davon ausgenommen.
+* Ist das Zammad-Ticket schon geschlossen und hat der Kunde geschrieben, wird es wieder geöffnet
+  (`zammad.followup_state`, Standard `open`).
+* In Znuny kommt eine Notiz „Nachtrag: … Artikel an Zammad übertragen“ dazu, und `after_forward` wird
+  erneut angewendet.
+* Gibt es nichts Neues, ändert ein Aufruf von Hand nichts.
+
+Mit `--force` wird dagegen bewusst ein neues Zammad-Ticket angelegt.
+
 ## Doppelte Tickets und Abbrüche
 
 In `var/state.json` hält das Skript fest, welche Tickets schon weitergeleitet wurden:
 
-* Ein zweiter Aufruf legt kein weiteres Zammad-Ticket an. Steht nur noch die Aktualisierung in Znuny aus,
-  weil sie fehlgeschlagen ist oder weil der erste Aufruf `--no-source-update` hatte, wird sie dabei
-  nachgeholt. Mit `--force` wird trotzdem ein neues Zammad-Ticket angelegt.
+* Ein zweiter Aufruf legt kein weiteres Zammad-Ticket an (siehe *Nachträge*). Steht noch die
+  Aktualisierung in Znuny aus, weil sie fehlgeschlagen ist oder weil der erste Aufruf
+  `--no-source-update` hatte, wird sie dabei nachgeholt.
 * Bricht eine Weiterleitung ab (Netzwerk, zu großer Anhang …), setzt der nächste Aufruf dort fort.
   Welche Artikel schon in Zammad sind, erkennt das Skript an `preferences.znuny_article_id`.
 * Bricht das Anlegen selbst ab (z. B. Zeitüberschreitung, obwohl Zammad das Ticket schon gespeichert
   hat), sucht der nächste Aufruf zuerst in Zammad nach dem Tag `znuny-<Nummer>` und übernimmt das
-  gefundene Ticket. Ohne diesen Tag (`tag_ticket_number => false`) bittet es um eine manuelle Prüfung.
+  gefundene Ticket. Tickets aus früheren Weiterleitungen (`--force`) werden dabei nicht verwechselt.
+  Ohne verlässlichen Tag (`tag_ticket_number => false` oder Zammad setzt ihn nicht) bittet das Skript
+  um eine manuelle Prüfung.
+* Lehnt Zammad ein `--force`-Anlegen ab (z. B. 422), bleibt die frühere Weiterleitung gespeichert.
 
 ## Bekannte Einschränkungen
 

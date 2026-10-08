@@ -64,6 +64,8 @@ return [
         'state' => 'open',
         // Eigene Zuordnungen Znuny-Status => Zammad-Status:
         // 'state_map' => ['in Bearbeitung' => 'open'],
+        // Status, auf den ein geschlossenes Zammad-Ticket bei einem Nachtrag des Kunden gesetzt wird.
+        'followup_state' => 'open',
 
         // Znuny-Prioritaet => Zammad-Prioritaet (Standard: 1+2 -> 1 low, 3 -> 2 normal, 4+5 -> 3 high)
         // 'priority_map' => ['3 normal' => '2 normal'],

@@ -143,12 +143,27 @@ final class CliTest extends TestCase
 
         $this->assertSame(Cli::EXIT_OK, $this->run(['--batch']));
         $this->assertSame(Cli::EXIT_OK, $this->run(['--batch']));
-        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch', '--quiet']));
-        $this->assertStringContains('bereits weitergeleitete(s) Ticket(s) liegen noch in der Batch-Queue', $this->output);
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch']));
+        $this->assertStringContains('2 bereits weitergeleitete(s) Ticket(s) wieder in der Batch-Queue', $this->output);
 
         $state = json_decode((string) file_get_contents($this->stateFile), true);
         $this->assertSame(['4711', '4712', '4713'], array_map('strval', array_keys($state)));
         $this->assertCount(3, $this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~'));
+    }
+
+    public function testBatchForwardsCustomerReplyAsFollowUp(): void
+    {
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch']));
+        // Kundenantwort oeffnet das Ticket in Znuny wieder - es liegt erneut in der Batch-Queue.
+        $this->servers->znunyTicket['Closed'] = false;
+        $this->servers->znunyTicket['Article'][] = [
+            'ArticleID' => '120', 'SenderType' => 'customer', 'CommunicationChannel' => 'Email', 'IsVisibleForCustomer' => '1',
+            'From' => 'max.muster@acme.example', 'To' => 'support@firma.example', 'Subject' => 'Re', 'Body' => 'Noch eine Frage',
+        ];
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch']));
+        $this->assertStringContains('Nachtrag mit 1 Artikel(n) an Zammad #31001', $this->output);
+        $this->assertCount(1, $this->servers->tickets);
+        $this->assertTrue(!empty($this->servers->znunyTicket['Closed']), 'in Znuny wieder geschlossen');
     }
 
     public function testUnwritableStateFileStopsBeforeZammad(): void

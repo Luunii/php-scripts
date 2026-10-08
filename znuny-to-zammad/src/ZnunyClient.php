@@ -157,8 +157,10 @@ final class ZnunyClient
 
     /**
      * Fuegt eine interne Notiz hinzu (fuer Kunden unsichtbar).
+     *
+     * @return int ArticleID der Notiz (0, falls Znuny keine liefert)
      */
-    public function addInternalNote(int $ticketId, string $subject, string $body, bool $noAgentNotify = false): void
+    public function addInternalNote(int $ticketId, string $subject, string $body, bool $noAgentNotify = false): int
     {
         $article = [
             'CommunicationChannel' => 'Internal',
@@ -175,7 +177,9 @@ final class ZnunyClient
             $article['NoAgentNotify'] = 1;
         }
 
-        $this->call('TicketUpdate', ['TicketID' => $ticketId], [], ['Article' => $article]);
+        $data = $this->call('TicketUpdate', ['TicketID' => $ticketId], [], ['Article' => $article]);
+
+        return (int) ($data['ArticleID'] ?? 0);
     }
 
     /**

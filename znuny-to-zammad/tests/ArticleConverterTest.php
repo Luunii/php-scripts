@@ -279,6 +279,31 @@ final class ArticleConverterTest extends TestCase
         $this->assertFalse(isset($payload['attachments']));
     }
 
+    public function testHugeEmbeddedDataImageDoesNotBreakBody(): void
+    {
+        // Bereits eingebettetes Bild (~6 MB) plus cid-Logo: frueher scheiterte die Regex (backtrack_limit).
+        $html    = '<p><img src="data:image/png;base64,' . str_repeat('A', 6000000) . '"></p><p>Text<img alt="l" src="cid:logo@x"></p>';
+        $article = $this->htmlArticle($html, [
+            ['Filename' => 'logo.png', 'ContentType' => 'image/png', 'ContentID' => '<logo@x>', 'Disposition' => 'inline', 'FilesizeRaw' => '1', 'Content' => base64_encode('L')],
+        ]);
+        $payload = $this->converter(['article_header' => false])->convert($article, true)['payload'];
+        $this->assertSame('text/html', $payload['content_type']);
+        $this->assertStringContains('<p>Text<img alt="l" src="data:image/png;base64,TA=="></p>', $payload['body']);
+    }
+
+    public function testRepeatedInlineImageCountsEveryCopy(): void
+    {
+        $mb      = 1024 * 1024;
+        $html    = '<img src="cid:a@x"><img src="cid:a@x"><img src="cid:a@x">';
+        $article = $this->htmlArticle($html, [
+            ['Filename' => 'a.jpg', 'ContentType' => 'image/jpeg', 'ContentID' => '<a@x>', 'Disposition' => 'inline', 'FilesizeRaw' => (string) (15 * $mb), 'Content' => base64_encode('A')],
+        ]);
+        $payload = $this->converter()->convert($article, true)['payload'];
+        // 35 MB Grenze: zwei Kopien (30 MB) passen, die dritte bleibt ein cid-Verweis.
+        $this->assertSame(2, substr_count($payload['body'], 'data:image/jpeg'));
+        $this->assertSame(1, substr_count($payload['body'], 'cid:a@x'));
+    }
+
     public function testLongRecipientListIsNotTruncated(): void
     {
         $to = [];

@@ -43,6 +43,7 @@ final class Config
                 'state'                   => null,
                 'state_map'               => [],
                 'default_state'           => 'open',
+                'followup_state'          => 'open',
                 'priority_map'            => [
                     '1 very low'  => '1 low',
                     '2 low'       => '1 low',
@@ -108,13 +109,20 @@ final class Config
                 $file
             ));
         }
-        $config = require $file;
+        try {
+            $config = require $file;
+        } catch (\ParseError $e) {
+            throw new \RuntimeException(sprintf('Konfigurationsdatei "%s", Zeile %d: %s', $file, $e->getLine(), $e->getMessage()));
+        }
         if (!is_array($config)) {
             throw new \RuntimeException(sprintf('Die Konfigurationsdatei "%s" muss ein Array zurueckgeben.', $file));
         }
 
         $config = self::merge(self::defaults(), $config);
         // false/'' bei optionalen Pfaden bedeutet "nicht gesetzt".
+        if (is_int($config['memory_limit'])) {
+            $config['memory_limit'] = (string) $config['memory_limit'];
+        }
         foreach (['state_file', 'lock_file', 'log_file', 'memory_limit'] as $key) {
             $config[$key] = self::optionalString($config[$key], $key);
         }
@@ -199,7 +207,7 @@ final class Config
             return null;
         }
         if (!is_string($value)) {
-            throw new \RuntimeException(sprintf('%s muss ein Text (Pfad) oder null sein.', $key));
+            throw new \RuntimeException(sprintf('%s muss ein Text oder null sein.', $key));
         }
 
         return $value;

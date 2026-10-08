@@ -60,9 +60,40 @@ final class StateStore
         }
     }
 
+    /** Schluessel fuer allgemeine Vermerke (keine Ticket-ID). */
+    private const META = '_meta';
+
+    /**
+     * Anzahl der Ticket-Eintraege.
+     */
     public function count(): int
     {
-        return count($this->data);
+        return count($this->data) - (isset($this->data[self::META]) ? 1 : 0);
+    }
+
+    /**
+     * @return mixed|null
+     */
+    public function meta(string $name)
+    {
+        return $this->data[self::META][$name] ?? null;
+    }
+
+    /**
+     * @param mixed|null $value null = Vermerk entfernen
+     */
+    public function setMeta(string $name, $value): void
+    {
+        $meta = (array) ($this->data[self::META] ?? []);
+        if (($meta[$name] ?? null) === $value) {
+            return;
+        }
+        if ($value === null) {
+            unset($meta[$name]);
+        } else {
+            $meta[$name] = $value;
+        }
+        $this->update(self::META, $meta);
     }
 
     /**

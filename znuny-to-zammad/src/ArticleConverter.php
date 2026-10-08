@@ -353,10 +353,10 @@ final class ArticleConverter
         $html = self::toUtf8($raw, self::charsetOf((string) ($attachment['ContentType'] ?? '')));
 
         // Nur den Inhalt von <body> uebernehmen (Zammad entfernt <head>/<style> ohnehin).
-        if (preg_match('~<body\b[^>]*>(.*)</body\s*>~is', $html, $m)) {
+        if (preg_match('~<body\b[^>]*+>(.*)</body\s*>~is', $html, $m)) {
             $html = $m[1];
         } else {
-            $html = (string) preg_replace('~<head\b.*?</head\s*>~is', '', $html);
+            $html = preg_replace('~<head\b.*?</head\s*>~is', '', $html) ?? $html;
         }
 
         return trim($html);
@@ -387,41 +387,57 @@ final class ArticleConverter
         $maxSize  = (int) ($this->options['max_attachment_size'] ?? 0);
         $maxTotal = (int) ($this->options['max_article_attachments_size'] ?? 0);
         $total    = 0;
+        $before   = $used;
 
-        return (string) preg_replace_callback(
-            '~(<img\b[^>]*?\bsrc\s*=\s*)(["\'])cid:([^"\']+)\2~i',
-            static function (array $m) use ($attachments, $byCid, &$used, &$total, $maxSize, $maxTotal): string {
-                $key = mb_strtolower(rawurldecode(trim($m[3])));
-                if (!isset($byCid[$key])) {
-                    return $m[0];
-                }
-                $index      = $byCid[$key];
-                $attachment = $attachments[$index];
-                $mime       = self::mimeType((string) ($attachment['ContentType'] ?? ''));
-                $content    = (string) ($attachment['Content'] ?? '');
-                if ($content === '' || strpos($mime, 'image/') !== 0) {
-                    return $m[0];
-                }
-                if ($mime === 'image/jpg') {
-                    $mime = 'image/jpeg';
-                }
-                $size = self::size($attachment);
-                $convertible = in_array($mime, self::ZAMMAD_INLINE_TYPES, true);
-                if (!$convertible && $size > self::MAX_EMBEDDED_OTHER_IMAGE) {
-                    return $m[0];
-                }
-                if (!in_array($index, $used, true)) {
-                    if (($maxSize > 0 && $size > $maxSize) || ($maxTotal > 0 && $total + $size > $maxTotal)) {
-                        return $m[0];
-                    }
-                    $total += $size;
-                    $used[] = $index;
-                }
+        $replace = static function (array $m) use ($attachments, $byCid, &$used, &$total, $maxSize, $maxTotal): string {
+            $key = mb_strtolower(rawurldecode(trim($m[3])));
+            if (!isset($byCid[$key])) {
+                return $m[0];
+            }
+            $index      = $byCid[$key];
+            $attachment = $attachments[$index];
+            $mime       = self::mimeType((string) ($attachment['ContentType'] ?? ''));
+            $content    = (string) ($attachment['Content'] ?? '');
+            if ($content === '' || strpos($mime, 'image/') !== 0) {
+                return $m[0];
+            }
+            if ($mime === 'image/jpg') {
+                $mime = 'image/jpeg';
+            }
+            $size        = self::size($attachment);
+            $convertible = in_array($mime, self::ZAMMAD_INLINE_TYPES, true);
+            if (!$convertible && $size > self::MAX_EMBEDDED_OTHER_IMAGE) {
+                return $m[0];
+            }
+            // Jede Einbettung zaehlt: Zammad legt pro Vorkommen einen eigenen Anhang an.
+            if (($maxSize > 0 && $size > $maxSize) || ($maxTotal > 0 && $total + $size > $maxTotal)) {
+                return $m[0];
+            }
+            $total += $size;
+            if (!in_array($index, $used, true)) {
+                $used[] = $index;
+            }
 
-                return $m[1] . $m[2] . 'data:' . $mime . ';base64,' . $content . $m[2];
+            return $m[1] . $m[2] . 'data:' . $mime . ';base64,' . $content . $m[2];
+        };
+
+        // Erst ganze <img>-Tags (possessiv, ohne Backtracking - auch bei riesigen data:-URIs),
+        // dann innerhalb des Tags nach src="cid:..." suchen.
+        $result = preg_replace_callback(
+            '~<img\b[^>]*+>~i',
+            static function (array $tag) use ($replace): string {
+                return preg_replace_callback('~(\bsrc\s*=\s*)(["\'])cid:([^"\']+)\2~i', $replace, $tag[0]) ?? $tag[0];
             },
             $html
         );
+        if ($result === null) {
+            // Regex-Grenze erreicht: Bilder lieber als normale Anhaenge senden als den Text zu verlieren.
+            $used = $before;
+
+            return $html;
+        }
+
+        return $result;
     }
 
     /**
@@ -429,7 +445,7 @@ final class ArticleConverter
      */
     private static function zammadBodyLength(string $html): int
     {
-        return mb_strlen((string) preg_replace('~data:image/(?:png|jpe?g);base64,[A-Za-z0-9+/=]+~i', '', $html));
+        return mb_strlen(preg_replace('~data:image/(?:png|jpe?g);base64,[A-Za-z0-9+/=]++~i', '', $html) ?? $html);
     }
 
     /**

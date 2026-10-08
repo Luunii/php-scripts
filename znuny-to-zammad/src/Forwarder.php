@@ -56,37 +56,19 @@ final class Forwarder
         $key          = (string) $znunyTicketId;
         $entry        = $this->state->get($key);
 
+        $previous = null;
         if ($entry !== null && $force) {
             $this->logger->warn(sprintf(
                 'Znuny-Ticket %s wurde bereits als Zammad #%s weitergeleitet - --force legt ein weiteres Ticket an.',
                 $entry['znuny_ticket_number'] ?? $key,
                 $entry['zammad_ticket_number'] ?? '?'
             ));
-            $entry = null;
+            $previous = $entry;
+            $entry    = null;
         }
 
         if ($entry !== null && !empty($entry['complete'])) {
-            $result = $this->result('skipped', $entry);
-            if ($updateSource && empty($entry['source_updated'])) {
-                if ($dryRun) {
-                    $this->logger->info(sprintf('Trockenlauf: Znuny-Ticket %s wuerde nachtraeglich aktualisiert.', $entry['znuny_ticket_number'] ?? $key));
-
-                    return $this->result('dry-run', $entry);
-                }
-                $this->logger->info(sprintf('Znuny-Ticket %s: Weiterleitung war erfolgreich, aktualisiere Znuny-Ticket nachtraeglich.', $entry['znuny_ticket_number'] ?? $key));
-                $result['warnings']             = $this->updateSource($znunyTicketId, $entry);
-                $result['source_update_failed'] = $result['warnings'] !== [];
-                $result['status']               = $result['warnings'] === [] ? 'source-updated' : 'skipped';
-
-                return $result;
-            }
-            $this->logger->info(sprintf(
-                'Znuny-Ticket %s wurde bereits weitergeleitet (Zammad #%s) - uebersprungen. Mit --force erneut weiterleiten.',
-                $entry['znuny_ticket_number'] ?? $key,
-                $entry['zammad_ticket_number'] ?? '?'
-            ));
-
-            return $result;
+            return $this->followUp($znunyTicketId, $entry, $options);
         }
 
         $this->checkMemory($znunyTicketId);
@@ -95,12 +77,9 @@ final class Forwarder
         $forward  = $this->config['forward'];
         $warnings = [];
 
-        $converter = new ArticleConverter(
-            $forward,
-            (string) ($this->config['znuny']['timezone'] ?? 'UTC'),
-            (string) ($forward['display_timezone'] ?? 'Europe/Berlin')
-        );
+        $converter   = $this->converter($forward);
         $allArticles = array_values(array_filter((array) ($ticket['Article'] ?? []), 'is_array'));
+        $maxArticleId = self::maxArticleId($allArticles);
         $articles    = $converter->selectArticles($ticket);
         if ($articles === []) {
             throw new \RuntimeException(sprintf('Znuny-Ticket %s: keine Artikel zum Weiterleiten gefunden.', $number));
@@ -162,10 +141,12 @@ final class Forwarder
         }
 
         // Anlegen bzw. abgebrochenen Lauf fortsetzen.
+        $pending = null;
         if ($entry !== null && empty($entry['zammad_ticket_id'])) {
             // Der letzte Versuch brach beim Anlegen ab (z. B. Zeitueberschreitung) - vielleicht
             // hat Zammad das Ticket trotzdem angelegt. Dann dieses Ticket uebernehmen.
-            $entry = $this->adoptInterruptedCreate($key, $number, $entry, (string) $group['name']);
+            $pending = $entry;
+            $entry   = $this->adoptInterruptedCreate($key, $number, $entry, (string) $group['name']);
         }
         $resumed = $entry !== null;
         $expectedTags = $tags !== '' ? explode(',', $tags) : [];
@@ -185,12 +166,23 @@ final class Forwarder
             $ticketPayload['article'] = $first['payload'];
 
             // Vor dem Anlegen vermerken: bricht die Anfrage ab, sucht der naechste Lauf erst in Zammad.
-            $this->state->set($key, [
+            // Eine fruehere Weiterleitung (--force) wird mitgemerkt: sie wird bei einer Ablehnung
+            // wiederhergestellt und beim Wiederfinden nicht mit dem neuen Ticket verwechselt.
+            $restore = $previous ?? ($pending['previous'] ?? null);
+            $known   = self::knownZammadIds($previous ?? $pending);
+            $marker  = [
                 'znuny_ticket_number' => $number,
                 'create_started_at'   => date('c'),
                 'complete'            => false,
-            ]);
-            $created = $this->createTicket($ticketPayload, $number, $key);
+            ];
+            if ($known !== []) {
+                $marker['exclude_ticket_ids'] = $known;
+            }
+            if ($restore !== null) {
+                $marker['previous'] = $restore;
+            }
+            $this->state->set($key, $marker);
+            $created = $this->createTicket($ticketPayload, $number, $key, $restore);
             $zammadTicketId = (int) $created['id'];
             $entry = [
                 'znuny_ticket_number'  => $number,
@@ -203,6 +195,9 @@ final class Forwarder
                 'source_updated'       => false,
                 'forwarded_at'         => date('c'),
             ];
+            if ($known !== []) {
+                $entry['earlier_zammad_ticket_ids'] = $known;
+            }
             $this->state->set($key, $entry);
             $done = [$first['id'] => true];
             $this->logger->debug(sprintf('Zammad-Ticket #%s angelegt (ID %d).', $entry['zammad_ticket_number'], $zammadTicketId));
@@ -236,15 +231,17 @@ final class Forwarder
 
         // Abschlusskontrollen: Status, Tags, von Zammad erzeugte E-Mails.
         $checks = $this->ensureState($zammadTicketId, $zammadState, $pendingTime);
-        $checks = array_merge($checks, $this->checkTags($zammadTicketId, $expectedTags));
+        $numberTag = !empty($this->config['zammad']['tag_ticket_number']) ? 'znuny-' . mb_strtolower($number) : '';
+        $checks = array_merge($checks, $this->checkTags($zammadTicketId, $expectedTags, $numberTag));
         $checks = array_merge($checks, $this->detectAutomaticMails($zammadTicketId));
         foreach ($checks as $warning) {
             $warnings[] = $warning;
             $this->logger->warn(sprintf('Znuny-Ticket %s: %s', $number, $warning));
         }
 
-        $entry['complete']     = true;
-        $entry['completed_at'] = date('c');
+        $entry['complete']              = true;
+        $entry['completed_at']          = date('c');
+        $entry['znuny_last_article_id'] = $maxArticleId;
         $this->state->set($key, $entry);
 
         $result = $this->result($resumed ? 'resumed' : 'forwarded', $entry);
@@ -263,10 +260,11 @@ final class Forwarder
      * Schreibt in Znuny eine interne Notiz und setzt ggf. Queue/Status.
      *
      * @param array<string,mixed> $entry
+     * @param int                 $followUpArticles >0 = Nachtrag mit so vielen Artikeln, -1 = nur Status/Queue erneut setzen
      *
      * @return string[] Warnungen
      */
-    private function updateSource(int $znunyTicketId, array $entry): array
+    private function updateSource(int $znunyTicketId, array $entry, int $followUpArticles = 0): array
     {
         $after    = (array) ($this->config['znuny']['after_forward'] ?? []);
         $key      = (string) $znunyTicketId;
@@ -275,16 +273,24 @@ final class Forwarder
         $warnings = [];
 
         try {
-            if (!empty($after['note']) && empty($entry['source_note_done'])) {
+            if (!empty($after['note']) && empty($entry['source_note_done']) && $followUpArticles >= 0) {
+                $intro = $followUpArticles > 0
+                    ? sprintf('Nachtrag: %d neue(r) Artikel an Zammad uebertragen.', $followUpArticles)
+                    : 'Dieses Ticket wurde an Zammad weitergeleitet.';
                 $body = sprintf(
-                    "Dieses Ticket wurde an Zammad weitergeleitet.\n\nZammad-Ticket: #%s\nGruppe: %s\nLink: %s\nZeitpunkt: %s\n",
+                    "%s\n\nZammad-Ticket: #%s\nGruppe: %s\nLink: %s\nZeitpunkt: %s\n",
+                    $intro,
                     $entry['zammad_ticket_number'] ?? '?',
                     $entry['zammad_group'] ?? '?',
                     $url,
                     $this->formatTime('now', date_default_timezone_get())
                 );
-                $subject = (string) ($after['note_subject'] ?? 'Ticket an Zammad weitergeleitet');
-                $this->znuny->addInternalNote($znunyTicketId, $subject, $body, !empty($after['no_agent_notify']));
+                $subject   = (string) ($after['note_subject'] ?? 'Ticket an Zammad weitergeleitet');
+                $articleId = $this->znuny->addInternalNote($znunyTicketId, $subject, $body, !empty($after['no_agent_notify']));
+                // Eigene Notizen merken, damit sie nie als Nachtrag zurueck nach Zammad gehen.
+                if ($articleId > 0) {
+                    $entry['znuny_note_ids'][] = $articleId;
+                }
                 $entry['source_note_done'] = true;
                 $this->state->set($key, $entry);
             }
@@ -319,11 +325,193 @@ final class Forwarder
     }
 
     /**
-     * @param array<string,mixed> $payload
+     * Bereits weitergeleitetes Ticket: neue Znuny-Artikel (z. B. eine Kundenantwort, die das
+     * Ticket in Znuny wieder geoeffnet hat) an das bestehende Zammad-Ticket anhaengen und
+     * die Znuny-Aktualisierung nachholen bzw. erneut anwenden.
+     *
+     * @param array<string,mixed> $entry
+     * @param array<string,mixed> $options
      *
      * @return array<string,mixed>
      */
-    private function createTicket(array $payload, string $number, string $key): array
+    private function followUp(int $znunyTicketId, array $entry, array $options): array
+    {
+        $dryRun         = !empty($options['dry_run']);
+        $updateSource   = $options['update_source'] ?? true;
+        $key            = (string) $znunyTicketId;
+        $number         = (string) ($entry['znuny_ticket_number'] ?? $key);
+        $zammadTicketId = (int) $entry['zammad_ticket_id'];
+        $result         = $this->result('skipped', $entry);
+
+        $this->checkMemory($znunyTicketId);
+        $ticket   = $this->znuny->getTicket($znunyTicketId);
+        $all      = array_values(array_filter((array) ($ticket['Article'] ?? []), 'is_array'));
+        $new      = $this->newArticles($ticket, $entry);
+        $pending  = $updateSource && empty($entry['source_updated']);
+        $reapply  = $updateSource && !empty($options['reapply_after_forward']);
+
+        if ($dryRun) {
+            $this->logger->info(sprintf(
+                'Trockenlauf: Znuny-Ticket %s ist bereits Zammad #%s; %d neue(r) Artikel wuerde(n) angehaengt%s.',
+                $number,
+                $entry['zammad_ticket_number'] ?? '?',
+                count($new),
+                $pending || $reapply || $new !== [] ? ', Znuny-Ticket wuerde aktualisiert' : ''
+            ));
+
+            return ['status' => 'dry-run', 'znuny_ticket_number' => $number, 'warnings' => []];
+        }
+
+        if ($new === []) {
+            if ($pending || $reapply) {
+                $this->logger->info(sprintf('Znuny-Ticket %s: bereits Zammad #%s, keine neuen Artikel - aktualisiere Znuny-Ticket.', $number, $entry['zammad_ticket_number'] ?? '?'));
+                $result['warnings']             = $this->updateSource($znunyTicketId, $entry, $pending ? 0 : -1);
+                $result['source_update_failed'] = $result['warnings'] !== [];
+                $result['status']               = $result['warnings'] === [] ? 'source-updated' : 'skipped';
+
+                return $result;
+            }
+            $this->logger->info(sprintf(
+                'Znuny-Ticket %s wurde bereits weitergeleitet (Zammad #%s), keine neuen Artikel - uebersprungen. Mit --force als neues Ticket weiterleiten.',
+                $number,
+                $entry['zammad_ticket_number'] ?? '?'
+            ));
+
+            return $result;
+        }
+
+        // Nachtrag: neue Artikel anhaengen.
+        $zammadTicket = $this->zammad->getTicket($zammadTicketId);
+        $group        = $this->zammad->findGroup((string) ($entry['zammad_group'] ?? ''));
+        $converter    = $this->converter($this->config['forward']);
+        $existing     = $this->articlesInZammad($zammadTicketId)['articles'];
+        $warnings     = [];
+        $customer     = false;
+        foreach ($new as $article) {
+            $id = (int) ($article['ArticleID'] ?? 0);
+            if (!isset($existing[$id])) {
+                $item = $converter->convert($article, !empty($group['email_address_id']));
+                foreach ($item['warnings'] as $warning) {
+                    $warnings[] = $warning;
+                    $this->logger->warn(sprintf('Znuny-Ticket %s: %s', $number, $warning));
+                }
+                // Neue Artikel sollen die zustaendigen Zammad-Agenten erreichen - nicht unterdruecken.
+                $this->zammad->createArticle(['ticket_id' => $zammadTicketId] + $item['payload'], false);
+            }
+            $customer = $customer || ArticleConverter::senderType($article) === 'customer';
+            $entry['articles_done'][] = $id;
+            $this->state->set($key, $entry);
+        }
+
+        // Geschlossenes Zammad-Ticket wieder oeffnen, wenn der Kunde geschrieben hat.
+        $state = $this->zammad->findStateById((int) ($zammadTicket['state_id'] ?? 0));
+        if ($customer && $state !== null && ($state['state_type'] ?? '') === 'closed') {
+            $reopen = $this->zammad->findState((string) ($this->config['zammad']['followup_state'] ?? 'open'));
+            if ($reopen !== null) {
+                try {
+                    $this->zammad->updateTicket($zammadTicketId, ['state_id' => (int) $reopen['id']]);
+                } catch (ApiException $e) {
+                    $warnings[] = sprintf('Zammad-Ticket #%s konnte nicht wieder geoeffnet werden: %s', $entry['zammad_ticket_number'] ?? '?', $e->getMessage());
+                }
+            }
+        }
+
+        $entry['znuny_last_article_id'] = self::maxArticleId($all);
+        $entry['source_note_done']      = false;
+        $entry['source_updated']        = false;
+        $entry['followups']             = (int) ($entry['followups'] ?? 0) + 1;
+        $this->state->set($key, $entry);
+        $this->logger->info(sprintf('Znuny-Ticket %s: Nachtrag mit %d Artikel(n) an Zammad #%s angehaengt.', $number, count($new), $entry['zammad_ticket_number'] ?? '?'));
+
+        $result             = $this->result('followup', $entry);
+        $result['articles'] = count($new);
+        if ($updateSource) {
+            $sourceWarnings                 = $this->updateSource($znunyTicketId, $entry, count($new));
+            $result['source_update_failed'] = $sourceWarnings !== [];
+            $warnings                       = array_merge($warnings, $sourceWarnings);
+        }
+        $result['warnings'] = $warnings;
+
+        return $result;
+    }
+
+    /**
+     * Znuny-Artikel, die seit der Weiterleitung hinzugekommen sind (ohne eigene Notizen).
+     *
+     * @param array<string,mixed> $ticket
+     * @param array<string,mixed> $entry
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    private function newArticles(array $ticket, array $entry): array
+    {
+        $done = array_flip(array_map('intval', (array) ($entry['articles_done'] ?? [])));
+        $own  = array_flip(array_map('intval', (array) ($entry['znuny_note_ids'] ?? [])));
+        $last = (int) ($entry['znuny_last_article_id'] ?? ($done === [] ? 0 : max(array_keys($done))));
+
+        // Fuer Nachtraege immer alle neuen Artikel (unabhaengig von forward.articles = first/last).
+        $selected = $this->converter(['articles' => 'all'] + $this->config['forward'])->selectArticles($ticket);
+
+        return array_values(array_filter($selected, static function (array $article) use ($done, $own, $last): bool {
+            $id = (int) ($article['ArticleID'] ?? 0);
+
+            return $id > $last && !isset($done[$id]) && !isset($own[$id]);
+        }));
+    }
+
+    /**
+     * @param array<string,mixed> $forward
+     */
+    private function converter(array $forward): ArticleConverter
+    {
+        return new ArticleConverter(
+            $forward,
+            (string) ($this->config['znuny']['timezone'] ?? 'UTC'),
+            (string) ($forward['display_timezone'] ?? 'Europe/Berlin')
+        );
+    }
+
+    /**
+     * @param array<int,array<string,mixed>> $articles
+     */
+    private static function maxArticleId(array $articles): int
+    {
+        $max = 0;
+        foreach ($articles as $article) {
+            $max = max($max, (int) ($article['ArticleID'] ?? 0));
+        }
+
+        return $max;
+    }
+
+    /**
+     * Zammad-Tickets frueherer Weiterleitungen desselben Znuny-Tickets.
+     *
+     * @param array<string,mixed>|null $entry
+     *
+     * @return int[]
+     */
+    private static function knownZammadIds(?array $entry): array
+    {
+        if ($entry === null) {
+            return [];
+        }
+        $ids = array_merge(
+            (array) ($entry['exclude_ticket_ids'] ?? []),
+            (array) ($entry['earlier_zammad_ticket_ids'] ?? []),
+            [(int) ($entry['zammad_ticket_id'] ?? 0)]
+        );
+
+        return array_values(array_unique(array_filter(array_map('intval', $ids))));
+    }
+
+    /**
+     * @param array<string,mixed>      $payload
+     * @param array<string,mixed>|null $restore fruehere Weiterleitung (--force), wird bei Ablehnung wiederhergestellt
+     *
+     * @return array<string,mixed>
+     */
+    private function createTicket(array $payload, string $number, string $key, ?array $restore): array
     {
         try {
             try {
@@ -342,7 +530,11 @@ final class Forwarder
             // Bei 4xx hat Zammad sicher nichts angelegt: Vermerk wieder entfernen.
             // Bei Zeitueberschreitung/5xx bleibt er stehen (siehe adoptInterruptedCreate()).
             if ($e->getCode() >= 400 && $e->getCode() < 500) {
-                $this->state->remove($key);
+                if ($restore !== null) {
+                    $this->state->set($key, $restore);
+                } else {
+                    $this->state->remove($key);
+                }
             }
             throw $e;
         }
@@ -371,15 +563,27 @@ final class Forwarder
             ));
         }
 
-        $ids = $this->zammad->findTicketIdsByTag('znuny-' . $number);
+        // Tickets frueherer Weiterleitungen (--force) tragen denselben Tag - nicht verwechseln.
+        $known = self::knownZammadIds($entry);
+        $ids   = array_values(array_diff($this->zammad->findTicketIdsByTag('znuny-' . $number), $known));
         if (count($ids) > 1) {
             throw new \RuntimeException(sprintf(
-                'In Zammad gibt es mehrere Tickets mit dem Tag znuny-%s (IDs %s). Bitte pruefen und ggf. mit --force erneut weiterleiten.',
+                'In Zammad gibt es mehrere neue Tickets mit dem Tag znuny-%s (IDs %s). Bitte die ueberzaehligen zusammenfuehren '
+                . 'oder ihren Tag znuny-%s entfernen und erneut ausfuehren.',
                 $number,
-                implode(', ', $ids)
+                implode(', ', $ids),
+                $number
             ));
         }
         if ($ids === []) {
+            if (!empty($this->state->meta('ticket_tag_missing_at'))) {
+                // Zammad hat zuletzt den Tag znuny-<Nummer> verworfen - ein leeres Suchergebnis beweist nichts.
+                throw new \RuntimeException(sprintf(
+                    'Das Anlegen in Zammad wurde am %s unterbrochen, und Zammad setzt den Tag znuny-<Nummer> nicht (Einstellung "Neue Tags"). '
+                    . 'Bitte in Zammad pruefen, ob das Ticket existiert, und dann mit --force erneut weiterleiten.',
+                    $since
+                ));
+            }
             $this->logger->info(sprintf('Znuny-Ticket %s: das unterbrochene Anlegen vom %s hat kein Zammad-Ticket hinterlassen, lege neu an.', $number, $since));
 
             return null;
@@ -398,6 +602,9 @@ final class Forwarder
             'source_updated'       => false,
             'forwarded_at'         => $since,
         ];
+        if ($known !== []) {
+            $adopted['earlier_zammad_ticket_ids'] = $known;
+        }
         $this->state->set($key, $adopted);
 
         return $adopted;
@@ -414,15 +621,24 @@ final class Forwarder
         if ($limit <= 0) {
             return;
         }
-        $meta  = $this->znuny->getTicket($znunyTicketId, false);
-        $total = 0;
+        $meta      = $this->znuny->getTicket($znunyTicketId, false);
+        $perArticleLimit = (int) ($this->config['forward']['max_article_attachments_size'] ?? 0);
+        $total     = 0;
+        $maxInline = 0;
         foreach ((array) ($meta['Article'] ?? []) as $article) {
+            $inline = 0;
             foreach ((array) ($article['Attachment'] ?? []) as $attachment) {
-                $total += (int) ($attachment['FilesizeRaw'] ?? 0);
+                $size   = (int) ($attachment['FilesizeRaw'] ?? 0);
+                $total += $size;
+                if (trim((string) ($attachment['ContentID'] ?? '')) !== '' && stripos((string) ($attachment['ContentType'] ?? ''), 'image/') === 0) {
+                    $inline += $size;
+                }
             }
+            $maxInline = max($maxInline, $perArticleLimit > 0 ? min($inline, $perArticleLimit) : $inline);
         }
-        // Base64 in der Znuny-Antwort, dekodiert, erneut als JSON fuer Zammad: grob Faktor 3.
-        $needed = memory_get_usage() + 3 * $total + 16 * 1024 * 1024;
+        // Base64 in der Znuny-Antwort, dekodiert, erneut als JSON fuer Zammad: grob Faktor 3;
+        // eingebettete Bilder liegen waehrend der Umwandlung zusaetzlich im Artikeltext.
+        $needed = memory_get_usage() + 3 * $total + 2 * $maxInline + 16 * 1024 * 1024;
         if ($needed > $limit) {
             throw new \RuntimeException(sprintf(
                 'Ticket zu gross fuer memory_limit %s (Anhaenge %s, benoetigt ca. %s). memory_limit in config.php erhoehen.',
@@ -747,7 +963,7 @@ final class Forwarder
      *
      * @return string[]
      */
-    private function checkTags(int $zammadTicketId, array $expected): array
+    private function checkTags(int $zammadTicketId, array $expected, string $numberTag): array
     {
         if ($expected === []) {
             return [];
@@ -760,9 +976,13 @@ final class Forwarder
         $missing = array_values(array_filter($expected, static function (string $tag) use ($actual): bool {
             return !in_array(mb_strtolower($tag), $actual, true);
         }));
+        if ($numberTag !== '') {
+            // Ohne den Tag znuny-<Nummer> laesst sich ein abgebrochenes Anlegen nicht wiederfinden.
+            $this->state->setMeta('ticket_tag_missing_at', in_array($numberTag, $missing, true) ? date('c') : null);
+        }
 
         return $missing === [] ? [] : [sprintf(
-            'Tags fehlen im Zammad-Ticket: %s. Tags in Zammad anlegen oder die Einstellung "Neue Tags" aktivieren (siehe README).',
+            'Tags fehlen im Zammad-Ticket: %s. Tags in Zammad anlegen bzw. die Einstellung "Neue Tags" aktivieren oder dem API-Benutzer admin.tag geben (siehe README).',
             implode(', ', $missing)
         )];
     }
