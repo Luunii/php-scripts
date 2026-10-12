@@ -68,7 +68,15 @@ cd /opt/otrs && su -c "bin/otrs.Console.pl Admin::WebService::Add --name Znuny2Z
 
 Der Webservice stellt `SessionCreate`, `TicketGet`, `TicketSearch` und `TicketUpdate` bereit. Wenn es
 schon den Beispiel-Webservice `GenericTicketConnectorREST` gibt, kann auch dieser genutzt werden
-(`'webservice' => 'GenericTicketConnectorREST'`).
+(`'webservice' => 'GenericTicketConnectorREST'`). Znuny liefert ihn in zwei Varianten mit
+unterschiedlicher Suche:
+
+* angelegt über die Admin-Oberfläche (Beispiel-Webservice, `var/webservices/examples`):
+  `TicketSearch` ist `POST /Ticket/Search` – passt ohne weitere Einstellung;
+* importiert aus `development/webservices`: `TicketSearch` ist `GET /Ticket` – dann zusätzlich in
+  `config.php` unter `znuny` eintragen: `'routes' => ['TicketSearch' => 'GET /Ticket']`.
+
+`--check` zeigt eine falsche Route sofort an (Fehler „HTTP::REST Error while determine Operation“).
 
 Außerdem wird ein Agent gebraucht, z. B. `zammad-bridge`, mit folgenden Rechten auf den betroffenen Queues:
 
@@ -167,8 +175,10 @@ Tickets dorthin, ein Cronjob leitet sie weiter und schließt sie in Znuny.
 */5 * * * * zammadbridge php /opt/php-scripts/znuny-to-zammad/bin/znuny2zammad.php --batch --quiet
 ```
 
-* Weitergeleitete Tickets müssen die Batch-Suche verlassen. Deshalb verlangt `--batch` einen Zielstatus
-  oder eine Ziel-Queue in `after_forward`; `--no-source-update` ist im Batch-Betrieb nicht erlaubt.
+* Weitergeleitete Tickets müssen die Batch-Suche verlassen. Deshalb verlangt `--batch` in
+  `after_forward` eine Queue außerhalb der Batch-Queues oder einen Status außerhalb von
+  `batch.state_types` (eigene Status-Namen kann das Skript nicht prüfen);
+  `--no-source-update` ist im Batch-Betrieb nicht erlaubt.
 * Antwortet der Kunde auf ein weitergeleitetes Ticket, öffnet Znuny es wieder, und es liegt erneut in der
   Batch-Queue. Der nächste Lauf hängt die neuen Artikel an das bestehende Zammad-Ticket an (siehe
   *Nachträge*) und schließt das Znuny-Ticket wieder.

@@ -94,7 +94,8 @@ final class Cli
                     throw new \RuntimeException('Keine Queue angegeben (--queue=NAME oder batch.queues in der Konfiguration).');
                 }
                 if (!$dryRun) {
-                    self::assertBatchLeavesQueue($config, !empty($options['no-source-update']));
+                    $queues = !empty($options['queue']) ? (array) $options['queue'] : (array) $config['batch']['queues'];
+                    self::assertBatchLeavesQueue($config, !empty($options['no-source-update']), $queues);
                 }
             }
             if ($config['memory_limit'] !== null) {
@@ -183,18 +184,48 @@ final class Cli
 
     /**
      * Im Batch-Betrieb muss ein weitergeleitetes Ticket die Suche verlassen (Status/Queue),
-     * sonst fuellen erledigte Tickets irgendwann jeden Lauf und neue kommen nie dran.
+     * sonst wird jedes erledigte Ticket bei jedem Lauf erneut verarbeitet.
      *
      * @param array<string,mixed> $config
+     * @param string[]            $queues durchsuchte Batch-Queues
      */
-    private static function assertBatchLeavesQueue(array $config, bool $noSourceUpdate): void
+    private static function assertBatchLeavesQueue(array $config, bool $noSourceUpdate, array $queues): void
     {
         $after = (array) $config['znuny']['after_forward'];
         if ($noSourceUpdate) {
             throw new \RuntimeException('--no-source-update ist im Batch-Betrieb nicht moeglich: weitergeleitete Tickets wuerden in der Queue bleiben.');
         }
-        if (empty($after['state']) && empty($after['queue'])) {
+        $queue = trim((string) ($after['queue'] ?? ''));
+        $state = trim((string) ($after['state'] ?? ''));
+        if ($queue === '' && $state === '') {
             throw new \RuntimeException('Fuer den Batch-Betrieb znuny.after_forward.state (z. B. "closed successful") oder znuny.after_forward.queue setzen, damit weitergeleitete Tickets die Queue verlassen.');
+        }
+
+        $leavesByQueue = $queue !== '' && !in_array($queue, array_map('strval', $queues), true);
+        // Statustypen der Znuny-Standardstatus; eigene Status lassen sich ohne Znuny nicht einordnen
+        // und gelten als "verlaesst die Suche".
+        $defaultTypes = [
+            'new'                 => 'new',
+            'open'                => 'open',
+            'closed successful'   => 'closed',
+            'closed unsuccessful' => 'closed',
+            'pending reminder'    => 'pending reminder',
+            'pending auto close+' => 'pending auto',
+            'pending auto close-' => 'pending auto',
+        ];
+        $stateTypes    = array_map('strtolower', array_map('strval', (array) $config['batch']['state_types']));
+        $type          = $defaultTypes[strtolower($state)] ?? null;
+        $leavesByState = $state !== '' && $stateTypes !== [] && ($type === null || !in_array($type, $stateTypes, true));
+
+        if (!$leavesByQueue && !$leavesByState) {
+            throw new \RuntimeException(sprintf(
+                'znuny.after_forward (Queue "%s", Status "%s") nimmt weitergeleitete Tickets nicht aus der Batch-Suche (Queues %s, Statustypen %s). '
+                . 'Eine andere Queue oder einen Status ausserhalb von batch.state_types (z. B. "closed successful") setzen.',
+                $queue,
+                $state,
+                implode(', ', $queues),
+                $stateTypes === [] ? 'alle' : implode(', ', $stateTypes)
+            ));
         }
     }
 
@@ -389,7 +420,7 @@ final class Cli
         }
         if ((array) $config['batch']['queues'] !== []) {
             try {
-                self::assertBatchLeavesQueue($config, false);
+                self::assertBatchLeavesQueue($config, false, (array) $config['batch']['queues']);
             } catch (\RuntimeException $e) {
                 $ok = false;
                 $logger->error('Batch: ' . $e->getMessage());

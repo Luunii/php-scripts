@@ -136,8 +136,9 @@ final class CliTest extends TestCase
 
     public function testBatchDoesNotStarveOnForwardedTicketsStillInQueue(): void
     {
-        // Ziel-Status vom Typ "offen": Tickets bleiben nach der Weiterleitung in der Queue.
-        $this->writeConfig(['batch' => ['queues' => ['An Zammad'], 'limit' => 1], 'znuny' => ['after_forward' => ['state' => 'open']]]);
+        // Eigener Status, der in Wahrheit vom Typ "offen" ist (vorab nicht pruefbar):
+        // Tickets bleiben nach der Weiterleitung in der Queue.
+        $this->writeConfig(['batch' => ['queues' => ['An Zammad'], 'limit' => 1], 'znuny' => ['after_forward' => ['state' => 'bei Zammad']]]);
         $this->servers->addZnunyTicket(4712);
         $this->servers->addZnunyTicket(4713);
 
@@ -150,6 +151,29 @@ final class CliTest extends TestCase
         unset($state['_meta']);
         $this->assertSame(['4711', '4712', '4713'], array_map('strval', array_keys($state)));
         $this->assertCount(3, $this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~'));
+    }
+
+    public function testBatchRejectsAfterForwardThatKeepsTicketsInSearch(): void
+    {
+        // Ziel-Queue ist selbst eine Batch-Queue.
+        $this->writeConfig(['znuny' => ['after_forward' => ['state' => null, 'queue' => 'An Zammad']]]);
+        $this->assertSame(Cli::EXIT_USAGE, $this->run(['--batch']));
+        $this->assertStringContains('nimmt weitergeleitete Tickets nicht aus der Batch-Suche', $this->output);
+
+        // Ziel-Status gehoert zu den gesuchten Statustypen (new, open).
+        $this->writeConfig(['znuny' => ['after_forward' => ['state' => 'open', 'queue' => null]]]);
+        $this->assertSame(Cli::EXIT_USAGE, $this->run(['--batch']));
+
+        // --queue ersetzt batch.queues - auch dagegen pruefen.
+        $this->writeConfig(['znuny' => ['after_forward' => ['state' => null, 'queue' => 'Sonder']]]);
+        $this->assertSame(Cli::EXIT_USAGE, $this->run(['--queue=Sonder']));
+        $this->assertCount(0, $this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~'));
+
+        // Andere Queue bzw. Status ausserhalb der Statustypen: erlaubt.
+        $this->writeConfig(['znuny' => ['after_forward' => ['state' => 'open', 'queue' => 'Weitergeleitet']]]);
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch', '--dry-run']));
+        $this->writeConfig(['znuny' => ['after_forward' => ['state' => 'pending reminder']]]);
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch']));
     }
 
     public function testBatchForwardsCustomerReplyAsFollowUp(): void

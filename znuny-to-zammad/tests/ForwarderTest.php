@@ -691,6 +691,42 @@ final class ForwarderTest extends TestCase
         $this->assertTrue($this->state()['complete']);
     }
 
+    public function testInterruptedFollowUpStillUpdatesZnuny(): void
+    {
+        $this->forwarder()->forward(4711);
+        $this->servers->znunyTicket['Article'][] = [
+            'ArticleID' => '140', 'SenderType' => 'customer', 'CommunicationChannel' => 'Email', 'IsVisibleForCustomer' => '1',
+            'From' => 'max.muster@acme.example', 'To' => 'support@firma.example', 'Subject' => 'Re', 'Body' => 'Noch da?',
+        ];
+        // Nach dem Anhangen bricht der Lauf ab (Statusliste von Zammad nicht abrufbar).
+        $calls = 0;
+        $this->servers->http->on('GET', '~/api/v1/ticket_states\?~', static function (array $request) use (&$calls) {
+            $calls++;
+            if ($calls === 1) {
+                return FakeServers::error(503, 'Service Unavailable');
+            }
+
+            return strpos($request['url'], 'page=1') === false ? [] : [['id' => 2, 'name' => 'open', 'state_type' => 'open'], ['id' => 4, 'name' => 'closed', 'state_type' => 'closed']];
+        });
+        $patches = count($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'));
+        $this->assertThrows(ApiException::class, function (): void {
+            $this->forwarder()->forward(4711);
+        }, '503');
+        $this->assertSame(1, $this->state()['pending_followup']);
+        $this->assertFalse($this->state()['source_updated']);
+
+        // Naechster Lauf: Artikel ist schon in Zammad, Notiz und Status in Znuny werden nachgeholt.
+        $result = $this->forwarder()->forward(4711);
+        $this->assertSame('source-updated', $result['status']);
+        $updates = array_slice($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'), $patches);
+        $this->assertCount(2, $updates);
+        $this->assertStringContains('Nachtrag: 1 neue(r) Artikel', FakeHttpClient::body($updates[0])['Article']['Body']);
+        $this->assertFalse(isset($this->state()['pending_followup']));
+        $this->assertSame(1, count(array_filter($this->servers->sentArticles(), static function (array $a): bool {
+            return ($a['preferences']['znuny_article_id'] ?? 0) === 140;
+        })), 'Artikel genau einmal in Zammad');
+    }
+
     public function testCustomerStoredWithPunycodeIsFound(): void
     {
         $this->servers->znunyTicket['CustomerUserID'] = 'max@müller.de';

@@ -292,6 +292,7 @@ final class Forwarder
                     $entry['znuny_note_ids'][] = $articleId;
                 }
                 $entry['source_note_done'] = true;
+                unset($entry['pending_followup']);
                 $this->state->set($key, $entry);
             }
 
@@ -310,6 +311,7 @@ final class Forwarder
             }
 
             $entry['source_updated'] = true;
+            unset($entry['pending_followup']);
             $this->state->set($key, $entry);
         } catch (ApiException $e) {
             $warning = sprintf(
@@ -366,7 +368,7 @@ final class Forwarder
         if ($new === []) {
             if ($pending || $reapply) {
                 $this->logger->info(sprintf('Znuny-Ticket %s: bereits Zammad #%s, keine neuen Artikel - aktualisiere Znuny-Ticket.', $number, $entry['zammad_ticket_number'] ?? '?'));
-                $result['warnings']             = $this->updateSource($znunyTicketId, $entry, $pending ? 0 : -1);
+                $result['warnings']             = $this->updateSource($znunyTicketId, $entry, $pending ? (int) ($entry['pending_followup'] ?? 0) : -1);
                 $result['source_update_failed'] = $result['warnings'] !== [];
                 $result['status']               = $result['warnings'] === [] ? 'source-updated' : 'skipped';
 
@@ -390,6 +392,14 @@ final class Forwarder
         $existing     = $this->articlesInZammad($zammadTicketId)['articles'];
         $warnings     = [];
         $customer     = false;
+
+        // Vorher vermerken, dass Znuny danach Notiz/Status braucht: bricht der Lauf nach dem
+        // Anhaengen ab, holt der naechste Lauf das nach (die Artikel gelten dann schon als erledigt).
+        $entry['source_note_done'] = false;
+        $entry['source_updated']   = false;
+        $entry['pending_followup'] = (int) ($entry['pending_followup'] ?? 0) + count($new);
+        $this->state->set($key, $entry);
+
         foreach ($new as $article) {
             $id = (int) ($article['ArticleID'] ?? 0);
             if (!isset($existing[$id])) {
@@ -428,8 +438,6 @@ final class Forwarder
         }
 
         $entry['znuny_last_article_id'] = self::maxArticleId($all);
-        $entry['source_note_done']      = false;
-        $entry['source_updated']        = false;
         $entry['followups']             = (int) ($entry['followups'] ?? 0) + 1;
         $this->state->set($key, $entry);
         $this->logger->info(sprintf('Znuny-Ticket %s: Nachtrag mit %d Artikel(n) an Zammad #%s angehaengt.', $number, count($new), $entry['zammad_ticket_number'] ?? '?'));
@@ -437,7 +445,7 @@ final class Forwarder
         $result             = $this->result('followup', $entry);
         $result['articles'] = count($new);
         if ($updateSource) {
-            $sourceWarnings                 = $this->updateSource($znunyTicketId, $entry, count($new));
+            $sourceWarnings                 = $this->updateSource($znunyTicketId, $entry, (int) $entry['pending_followup']);
             $result['source_update_failed'] = $sourceWarnings !== [];
             $warnings                       = array_merge($warnings, $sourceWarnings);
         }
