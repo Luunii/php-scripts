@@ -125,7 +125,10 @@ final class FakeServers
                 }
                 // Wie Znuny: aelteste zuerst, Limit in der Datenbank.
                 $tickets = [(int) $this->znunyTicket['TicketID'] => $this->znunyTicket] + $this->moreZnunyTickets;
-                ksort($tickets);
+                // SortBy Age = Erstellzeit (nicht zwingend die Reihenfolge der IDs).
+                uksort($tickets, static function (int $a, int $b) use ($tickets): int {
+                    return [(string) ($tickets[$a]['Created'] ?? ''), $a] <=> [(string) ($tickets[$b]['Created'] ?? ''), $b];
+                });
                 $ids = [];
                 foreach ($tickets as $id => $ticket) {
                     if (isset($body['Queues']) && isset($ticket['BatchQueue']) && !in_array($ticket['BatchQueue'], (array) $body['Queues'], true)) {

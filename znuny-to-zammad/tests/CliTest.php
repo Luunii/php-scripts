@@ -153,6 +153,25 @@ final class CliTest extends TestCase
         $this->assertCount(3, $this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~'));
     }
 
+    public function testBatchProcessesOldestFirstByCreationTime(): void
+    {
+        $this->writeConfig(['batch' => ['queues' => ['An Zammad'], 'limit' => 1]]);
+        $this->servers->addZnunyTicket(4712);
+        $this->servers->addZnunyTicket(4713);
+        // Erstellzeit folgt nicht der ID-Reihenfolge (z. B. importierte Tickets).
+        $this->servers->znunyTicket['Created']            = '2024-03-12 09:15:00';
+        $this->servers->moreZnunyTickets[4712]['Created'] = '2024-03-15 08:00:00';
+        $this->servers->moreZnunyTickets[4713]['Created'] = '2024-03-01 08:00:00';
+        // Fruehere Weiterleitungen vergroessern das Suchfenster ueber batch.limit hinaus.
+        $done = ['complete' => true, 'source_updated' => true, 'zammad_ticket_id' => 1];
+        file_put_contents($this->stateFile, json_encode(['9001' => $done, '9002' => $done]));
+
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--batch']));
+        $state = json_decode((string) file_get_contents($this->stateFile), true);
+        unset($state['_meta'], $state['9001'], $state['9002']);
+        $this->assertSame(['4713'], array_map('strval', array_keys($state)), 'aeltestes Ticket zuerst');
+    }
+
     public function testBatchRejectsAfterForwardThatKeepsTicketsInSearch(): void
     {
         // Ziel-Queue ist selbst eine Batch-Queue.

@@ -103,7 +103,7 @@ final class ArticleConverter
 
         $attachments = array_values(array_filter((array) ($article['Attachment'] ?? []), 'is_array'));
         $body        = $this->buildBody($article, $attachments, $warnings);
-        $files       = $this->buildAttachments($attachments, $body['used'], $warnings);
+        $files       = $this->buildAttachments($attachments, $body['used'], $body['embedded'], $warnings);
 
         $header = '';
         if (!empty($this->options['article_header']) || $files['skipped'] !== []) {
@@ -223,7 +223,9 @@ final class ArticleConverter
     {
         if ($sender !== 'customer') {
             // Agenten- und Systemartikel nie als E-Mail/SMS anlegen (wuerden versendet).
-            return $channel === 'Phone' ? 'phone' : 'note';
+            // Systemartikel immer als Notiz: Zammad zeigt den Text von System-Artikeln anderer
+            // Typen nicht an (nur Betreff/Empfaenger).
+            return $channel === 'Phone' && $sender === 'agent' ? 'phone' : 'note';
         }
 
         switch ($channel) {
@@ -274,7 +276,7 @@ final class ArticleConverter
      * @param array<int,array<string,mixed>> $attachments
      * @param string[]                       $warnings
      *
-     * @return array{body:string,content_type:string,used:int[]}
+     * @return array{body:string,content_type:string,used:int[],embedded:int}
      */
     private function buildBody(array $article, array $attachments, array &$warnings): array
     {
@@ -291,19 +293,20 @@ final class ArticleConverter
             if ($html !== null && trim(strip_tags($html, '<img>')) !== '') {
                 // 1. Versuch: Inline-Bilder einbetten (im Rahmen der Groessengrenzen).
                 $used     = [$htmlIndex];
+                $bytes    = 0;
                 // Mit forward.attachments = false auch keine Bilder einbetten (Zammad macht daraus Anhaenge);
                 // sie werden dann wie andere Anhaenge als "nicht uebernommen" aufgefuehrt.
                 $embedded = ($this->options['attachments'] ?? true)
-                    ? $this->embedInlineImages($html, $attachments, $used)
+                    ? $this->embedInlineImages($html, $attachments, $used, $bytes)
                     : $html;
                 if (self::zammadBodyLength($embedded) <= self::BODY_LIMIT) {
-                    return ['body' => $embedded, 'content_type' => 'text/html', 'used' => $used];
+                    return ['body' => $embedded, 'content_type' => 'text/html', 'used' => $used, 'embedded' => $bytes];
                 }
                 // 2. Versuch: Bilder als normale Anhaenge.
                 if (self::zammadBodyLength($html) <= self::BODY_LIMIT) {
                     $warnings[] = sprintf('Artikel %s: Text zu gross, Inline-Bilder werden als Anhang uebernommen.', $article['ArticleID'] ?? '?');
 
-                    return ['body' => $html, 'content_type' => 'text/html', 'used' => [$htmlIndex]];
+                    return ['body' => $html, 'content_type' => 'text/html', 'used' => [$htmlIndex], 'embedded' => 0];
                 }
                 // 3. Versuch: Klartext, HTML-Original bleibt als Anhang erhalten.
                 $warnings[] = sprintf('Artikel %s: HTML-Text zu gross, Klartext wird uebernommen (HTML als Anhang).', $article['ArticleID'] ?? '?');
@@ -319,7 +322,7 @@ final class ArticleConverter
             $plain = mb_substr($plain, 0, self::BODY_LIMIT) . "\n[... gekuerzt]";
         }
 
-        return ['body' => $plain, 'content_type' => 'text/plain', 'used' => $used];
+        return ['body' => $plain, 'content_type' => 'text/plain', 'used' => $used, 'embedded' => 0];
     }
 
     /**
@@ -373,10 +376,12 @@ final class ArticleConverter
      * dann von buildAttachments() ausgelassen und im Artikel vermerkt.
      *
      * @param array<int,array<string,mixed>> $attachments
-     * @param int[]                          $used Indizes der verbrauchten Anhaenge (wird ergaenzt)
+     * @param int[]                          $used  Indizes der verbrauchten Anhaenge (wird ergaenzt)
+     * @param int                            $bytes Groesse aller eingebetteten Kopien (wird gesetzt)
      */
-    private function embedInlineImages(string $html, array $attachments, array &$used): string
+    private function embedInlineImages(string $html, array $attachments, array &$used, int &$bytes): string
     {
+        $bytes = 0;
         $byCid = [];
         foreach ($attachments as $index => $attachment) {
             $cid = trim((string) ($attachment['ContentID'] ?? ''), " <>\t");
@@ -440,6 +445,7 @@ final class ArticleConverter
 
             return $html;
         }
+        $bytes = $total;
 
         return $result;
     }
@@ -454,12 +460,13 @@ final class ArticleConverter
 
     /**
      * @param array<int,array<string,mixed>> $attachments
-     * @param int[]                          $used
+     * @param int[]                          $used     eingebettete Anhaenge (nicht erneut anhaengen)
+     * @param int                            $embedded Groesse aller eingebetteten Kopien
      * @param string[]                       $warnings
      *
      * @return array{attachments: array<int,array<string,string>>, skipped: string[]}
      */
-    private function buildAttachments(array $attachments, array $used, array &$warnings): array
+    private function buildAttachments(array $attachments, array $used, int $embedded, array &$warnings): array
     {
         $result  = [];
         $skipped = [];
@@ -476,13 +483,8 @@ final class ArticleConverter
 
         $maxSize  = (int) ($this->options['max_attachment_size'] ?? 0);
         $maxTotal = (int) ($this->options['max_article_attachments_size'] ?? 0);
-        $total    = 0;
-        foreach ($used as $index) {
-            // Eingebettete Bilder zaehlen zur Anfragegroesse, der HTML-Text nicht.
-            if (isset($attachments[$index]) && $index !== $htmlIndex) {
-                $total += self::size($attachments[$index]);
-            }
-        }
+        // Eingebettete Bilder zaehlen zur Anfragegroesse - jede Kopie einzeln.
+        $total    = $embedded;
 
         $number = 0;
         foreach ($attachments as $index => $attachment) {

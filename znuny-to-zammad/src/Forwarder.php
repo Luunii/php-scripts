@@ -153,6 +153,19 @@ final class Forwarder
         if ($resumed) {
             $zammadTicketId = (int) $entry['zammad_ticket_id'];
             $this->logger->info(sprintf('Znuny-Ticket %s: setze abgebrochene Weiterleitung fort (Zammad #%s).', $number, $entry['zammad_ticket_number'] ?? $zammadTicketId));
+            // Das Ticket liegt in seiner tatsaechlichen Gruppe (Konfiguration oder Agenten koennen
+            // sie seit dem Abbruch geaendert haben) - deren E-Mail-Adresse ist massgeblich.
+            $actualGroup = $this->zammad->findGroupById((int) ($this->zammad->getTicket($zammadTicketId)['group_id'] ?? 0));
+            if ($actualGroup !== null && !empty($actualGroup['email_address_id']) !== $groupHasEmail) {
+                $groupHasEmail = !empty($actualGroup['email_address_id']);
+                $converted     = [];
+                foreach ($articles as $article) {
+                    $converted[] = ['id' => (int) ($article['ArticleID'] ?? 0), 'payload' => $converter->convert($article, $groupHasEmail)['payload']];
+                }
+            }
+            if ($actualGroup !== null) {
+                $entry['zammad_group'] = (string) $actualGroup['name'];
+            }
             $existing = $this->articlesInZammad($zammadTicketId);
             $done     = $existing['articles'];
             foreach ((array) ($entry['articles_done'] ?? []) as $id) {
@@ -292,7 +305,7 @@ final class Forwarder
                     $entry['znuny_note_ids'][] = $articleId;
                 }
                 $entry['source_note_done'] = true;
-                unset($entry['pending_followup']);
+                unset($entry['pending_followup_ids']);
                 $this->state->set($key, $entry);
             }
 
@@ -311,7 +324,7 @@ final class Forwarder
             }
 
             $entry['source_updated'] = true;
-            unset($entry['pending_followup']);
+            unset($entry['pending_followup_ids']);
             $this->state->set($key, $entry);
         } catch (ApiException $e) {
             $warning = sprintf(
@@ -368,7 +381,7 @@ final class Forwarder
         if ($new === []) {
             if ($pending || $reapply) {
                 $this->logger->info(sprintf('Znuny-Ticket %s: bereits Zammad #%s, keine neuen Artikel - aktualisiere Znuny-Ticket.', $number, $entry['zammad_ticket_number'] ?? '?'));
-                $result['warnings']             = $this->updateSource($znunyTicketId, $entry, $pending ? (int) ($entry['pending_followup'] ?? 0) : -1);
+                $result['warnings']             = $this->updateSource($znunyTicketId, $entry, $pending ? count((array) ($entry['pending_followup_ids'] ?? [])) : -1);
                 $result['source_update_failed'] = $result['warnings'] !== [];
                 $result['status']               = $result['warnings'] === [] ? 'source-updated' : 'skipped';
 
@@ -397,7 +410,13 @@ final class Forwarder
         // Anhaengen ab, holt der naechste Lauf das nach (die Artikel gelten dann schon als erledigt).
         $entry['source_note_done'] = false;
         $entry['source_updated']   = false;
-        $entry['pending_followup'] = (int) ($entry['pending_followup'] ?? 0) + count($new);
+        // Als ID-Liste, damit ein Wiederholungslauf schon gezaehlte Artikel nicht erneut zaehlt.
+        $entry['pending_followup_ids'] = array_values(array_unique(array_merge(
+            array_map('intval', (array) ($entry['pending_followup_ids'] ?? [])),
+            array_map(static function (array $article): int {
+                return (int) ($article['ArticleID'] ?? 0);
+            }, $new)
+        )));
         $this->state->set($key, $entry);
 
         foreach ($new as $article) {
@@ -445,7 +464,7 @@ final class Forwarder
         $result             = $this->result('followup', $entry);
         $result['articles'] = count($new);
         if ($updateSource) {
-            $sourceWarnings                 = $this->updateSource($znunyTicketId, $entry, (int) $entry['pending_followup']);
+            $sourceWarnings                 = $this->updateSource($znunyTicketId, $entry, count($entry['pending_followup_ids']));
             $result['source_update_failed'] = $sourceWarnings !== [];
             $warnings                       = array_merge($warnings, $sourceWarnings);
         }
@@ -1045,7 +1064,8 @@ final class Forwarder
         }));
         if ($numberTag !== '') {
             // Ohne den Tag znuny-<Nummer> laesst sich ein abgebrochenes Anlegen nicht wiederfinden.
-            $this->state->setMeta('ticket_tag_reliable', in_array($numberTag, $missing, true) ? null : true);
+            $missingLower = array_map('mb_strtolower', $missing);
+            $this->state->setMeta('ticket_tag_reliable', in_array(mb_strtolower($numberTag), $missingLower, true) ? null : true);
         }
 
         return $missing === [] ? [] : [sprintf(

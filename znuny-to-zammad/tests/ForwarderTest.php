@@ -712,7 +712,7 @@ final class ForwarderTest extends TestCase
         $this->assertThrows(ApiException::class, function (): void {
             $this->forwarder()->forward(4711);
         }, '503');
-        $this->assertSame(1, $this->state()['pending_followup']);
+        $this->assertSame([140], $this->state()['pending_followup_ids']);
         $this->assertFalse($this->state()['source_updated']);
 
         // Naechster Lauf: Artikel ist schon in Zammad, Notiz und Status in Znuny werden nachgeholt.
@@ -721,10 +721,72 @@ final class ForwarderTest extends TestCase
         $updates = array_slice($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'), $patches);
         $this->assertCount(2, $updates);
         $this->assertStringContains('Nachtrag: 1 neue(r) Artikel', FakeHttpClient::body($updates[0])['Article']['Body']);
-        $this->assertFalse(isset($this->state()['pending_followup']));
+        $this->assertFalse(isset($this->state()['pending_followup_ids']));
         $this->assertSame(1, count(array_filter($this->servers->sentArticles(), static function (array $a): bool {
             return ($a['preferences']['znuny_article_id'] ?? 0) === 140;
         })), 'Artikel genau einmal in Zammad');
+    }
+
+    public function testRetriedFollowUpCountsArticlesOnce(): void
+    {
+        $this->forwarder()->forward(4711); // 5 Artikel-Aufrufe (4 Artikel + Info-Notiz)
+        foreach (['150', '151', '152'] as $id) {
+            $this->servers->znunyTicket['Article'][] = [
+                'ArticleID' => $id, 'SenderType' => 'customer', 'CommunicationChannel' => 'Email', 'IsVisibleForCustomer' => '1',
+                'From' => 'max.muster@acme.example', 'To' => 'support@firma.example', 'Subject' => 'Re ' . $id, 'Body' => 'Text ' . $id,
+            ];
+        }
+        // Zweiter Nachtrags-Artikel scheitert, der erste ist schon in Zammad.
+        $this->servers->failArticleCall[7] = static function () {
+            return FakeServers::error(503, 'Service Unavailable');
+        };
+        $this->assertThrows(ApiException::class, function (): void {
+            $this->forwarder()->forward(4711);
+        }, '503');
+
+        $patches = count($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'));
+        $this->assertSame('followup', $this->forwarder()->forward(4711)['status']);
+        $note = FakeHttpClient::body(array_slice($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'), $patches)[0]);
+        $this->assertStringContains('Nachtrag: 3 neue(r) Artikel', $note['Article']['Body']);
+    }
+
+    public function testUppercaseTicketNumberWithDroppedTagIsNotReliable(): void
+    {
+        $this->servers->znunyTicket['TicketNumber'] = 'AB2024031210000017';
+        $this->servers->ticketCreateHandler = function (array $request) {
+            $body = FakeHttpClient::body($request);
+            unset($body['tags']);
+
+            return FakeHttpClient::json($this->servers->storeTicket($body), 201);
+        };
+        $this->forwarder()->forward(4711);
+        $state = json_decode((string) file_get_contents($this->stateFile), true);
+        $this->assertFalse(isset($state['_meta']['ticket_tag_reliable']), 'fehlender Tag darf nicht als zuverlaessig gelten');
+    }
+
+    public function testResumeUsesActualGroupOfZammadTicket(): void
+    {
+        $this->servers->znunyTicket['Article'][] = [
+            'ArticleID' => '106', 'SenderType' => 'customer', 'CommunicationChannel' => 'Email', 'IsVisibleForCustomer' => '1',
+            'From' => 'max.muster@acme.example', 'To' => 'support@firma.example', 'Subject' => 'Nachfrage', 'Body' => 'Und?',
+        ];
+        // Abbruch nach dem Anlegen (Artikel 102 scheitert) ...
+        $this->servers->failArticleCall[1] = static function () {
+            return FakeServers::error(503, 'Service Unavailable');
+        };
+        try {
+            $this->forwarder()->forward(4711);
+        } catch (ApiException $e) {
+        }
+        // ... inzwischen haben Agenten das Ticket in eine Gruppe ohne E-Mail-Adresse verschoben.
+        $this->servers->tickets[55]['group_id'] = 1;
+
+        $this->assertSame('resumed', $this->forwarder()->forward(4711)['status']);
+        $article = array_values(array_filter($this->servers->sentArticles(), static function (array $a): bool {
+            return ($a['preferences']['znuny_article_id'] ?? 0) === 106;
+        }))[0];
+        $this->assertSame('note', $article['type'], 'Gruppe ohne E-Mail-Adresse: Zammad wuerde den E-Mail-Artikel ablehnen');
+        $this->assertSame('Users', $this->state()['zammad_group']);
     }
 
     public function testCustomerStoredWithPunycodeIsFound(): void

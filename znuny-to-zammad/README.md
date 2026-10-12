@@ -184,7 +184,7 @@ Tickets dorthin, ein Cronjob leitet sie weiter und schließt sie in Znuny.
   *Nachträge*) und schließt das Znuny-Ticket wieder.
 * Jede Queue wird einzeln durchsucht. Ein falscher Queue-Name blockiert also nicht die anderen
   (`--check` zeigt leere Queues an).
-* Pro Lauf werden höchstens `batch.limit` Tickets verarbeitet, die ältesten zuerst.
+* Pro Lauf werden höchstens `batch.limit` neue Tickets verarbeitet, je Queue die ältesten zuerst.
 * Eine Sperrdatei neben der Statusdatei verhindert, dass zwei Läufe gleichzeitig arbeiten. Läuft schon
   einer, endet der nächste ohne Fehler.
 

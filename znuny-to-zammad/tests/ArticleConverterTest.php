@@ -316,6 +316,27 @@ final class ArticleConverterTest extends TestCase
         $this->assertSame(1, substr_count($payload['body'], 'cid:a@x'));
     }
 
+    public function testRepeatedInlineImageCountsTowardsAttachmentTotal(): void
+    {
+        $mb      = 1024 * 1024;
+        $article = $this->htmlArticle('<img src="cid:a@x"><img src="cid:a@x">', [
+            ['Filename' => 'a.jpg', 'ContentType' => 'image/jpeg', 'ContentID' => '<a@x>', 'Disposition' => 'inline', 'FilesizeRaw' => (string) (10 * $mb), 'Content' => base64_encode('A')],
+            ['Filename' => 'b.pdf', 'ContentType' => 'application/pdf', 'Disposition' => 'attachment', 'FilesizeRaw' => (string) (20 * $mb), 'Content' => base64_encode('B')],
+        ]);
+        $payload = $this->converter()->convert($article, true)['payload'];
+        // Zwei eingebettete Kopien (20 MB) + 20 MB PDF > 35 MB: PDF wird ausgelassen.
+        $this->assertSame(2, substr_count($payload['body'], 'data:image/jpeg'));
+        $this->assertFalse(isset($payload['attachments']));
+        $this->assertStringContains('b.pdf (20,0 MB, Gesamtgroesse ueberschritten)', $payload['body']);
+    }
+
+    public function testSystemArticleIsAlwaysReadableNote(): void
+    {
+        $payload = $this->converter()->convert(['ArticleID' => '1', 'SenderType' => 'system', 'CommunicationChannel' => 'Phone', 'IsVisibleForCustomer' => '1', 'Body' => 'x'], true)['payload'];
+        $this->assertSame('note', $payload['type'], 'Zammad blendet den Text von System-Artikeln ausser Notizen aus');
+        $this->assertSame('System', $payload['sender']);
+    }
+
     public function testLongRecipientListIsNotTruncated(): void
     {
         $to = [];

@@ -305,8 +305,8 @@ final class Cli
                 $found[$id] = true;
             }
         }
+        // Reihenfolge der Suche beibehalten (je Queue die aeltesten zuerst), Duplikate entfallen.
         $ids = array_keys($found);
-        sort($ids);
 
         $known = [];
         $new   = [];
