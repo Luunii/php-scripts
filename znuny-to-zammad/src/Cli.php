@@ -421,6 +421,15 @@ final class Cli
         if ((array) $config['batch']['queues'] !== []) {
             try {
                 self::assertBatchLeavesQueue($config, false, (array) $config['batch']['queues']);
+                $afterQueue = trim((string) ($config['znuny']['after_forward']['queue'] ?? ''));
+                if ($afterQueue !== '' && !in_array($afterQueue, array_map('strval', (array) $config['batch']['queues']), true)) {
+                    // Znuny oeffnet ein Ticket bei einer Kundenantwort in seiner aktuellen Queue wieder.
+                    $logger->warn(sprintf(
+                        'Batch: after_forward.queue "%s" liegt ausserhalb der Batch-Queues. Antwortet ein Kunde, oeffnet Znuny das Ticket dort wieder, '
+                        . 'und --batch findet den Nachtrag nicht - es sei denn, Znuny legt solche Tickets in eine Batch-Queue zurueck (siehe README).',
+                        $afterQueue
+                    ));
+                }
             } catch (\RuntimeException $e) {
                 $ok = false;
                 $logger->error('Batch: ' . $e->getMessage());

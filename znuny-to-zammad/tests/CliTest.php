@@ -246,6 +246,17 @@ final class CliTest extends TestCase
         $this->assertStringContains('keine Gruppe "Ohne Gruppe" - Tickets aus dieser Batch-Queue gehen in die Standardgruppe', $this->output);
     }
 
+    public function testCheckWarnsWhenAfterForwardQueueHidesFollowUps(): void
+    {
+        $this->writeConfig(['znuny' => ['after_forward' => ['queue' => 'Weitergeleitet']]]);
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--check']));
+        $this->assertStringContains('after_forward.queue "Weitergeleitet" liegt ausserhalb der Batch-Queues', $this->output);
+
+        $this->writeConfig([]);
+        $this->assertSame(Cli::EXIT_OK, $this->run(['--check']));
+        $this->assertStringNotContains('liegt ausserhalb der Batch-Queues', $this->output);
+    }
+
     public function testCheckWarnsAboutMissingGroupRights(): void
     {
         $this->servers->groupAccess = ['1' => ['create']];

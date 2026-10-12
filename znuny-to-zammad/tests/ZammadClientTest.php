@@ -81,6 +81,31 @@ final class ZammadClientTest extends TestCase
         }
     }
 
+    public function testSuccessWithoutJsonIsAnUncertainResult(): void
+    {
+        $http = new FakeHttpClient();
+        $http->on('POST', '~/api/v1/ticket_articles$~', new HttpResponse(200, '<html><body>Proxy</body></html>'))
+            ->on('GET', '~/api/v1/tickets/7$~', new HttpResponse(200, ''));
+        $client = $this->client($http);
+
+        foreach ([
+            static function () use ($client): void {
+                $client->createArticle(['ticket_id' => 7]);
+            },
+            static function () use ($client): void {
+                $client->getTicket(7);
+            },
+        ] as $call) {
+            try {
+                $call();
+                $this->assertTrue(false, 'Antwort ohne JSON darf nicht als Erfolg gelten');
+            } catch (ApiException $e) {
+                $this->assertStringContains('keine gueltige JSON-Antwort', $e->getMessage());
+                $this->assertSame(0, $e->getCode(), 'Ausgang ungewiss wie bei einer Zeitueberschreitung');
+            }
+        }
+    }
+
     public function testStatesAndPriorities(): void
     {
         $http = new FakeHttpClient();

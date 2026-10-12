@@ -393,9 +393,9 @@ final class ZammadClient
      * @param array<string,mixed>|null $body
      * @param array<string,string>     $extraHeaders
      *
-     * @return mixed
+     * @return array<mixed>
      */
-    private function request(string $method, string $path, ?array $body = null, array $extraHeaders = [])
+    private function request(string $method, string $path, ?array $body = null, array $extraHeaders = []): array
     {
         // Wichtig: niemals einen "From"-Header senden - Zammad wertet ihn als
         // "im Namen von"-Anfrage (Impersonation).
@@ -432,6 +432,19 @@ final class ZammadClient
             throw new ApiException(sprintf('Zammad %s %s: HTTP %d %s', $method, strtok($path, '?'), $response->status, $message), $response->status);
         }
 
-        return $response->json();
+        $data = $response->json();
+        if (!is_array($data)) {
+            // Z. B. eine Seite eines Proxys mit Status 200: Ausgang ungewiss wie bei einer
+            // Zeitueberschreitung (Code 0) - Abgleich und Wiederholung uebernehmen.
+            throw new ApiException(sprintf(
+                'Zammad %s %s: HTTP %d, aber keine gueltige JSON-Antwort: %s',
+                $method,
+                strtok($path, '?'),
+                $response->status,
+                mb_substr(trim(strip_tags($response->body)), 0, 200)
+            ));
+        }
+
+        return $data;
     }
 }

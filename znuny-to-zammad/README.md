@@ -179,12 +179,17 @@ Tickets dorthin, ein Cronjob leitet sie weiter und schließt sie in Znuny.
   `after_forward` eine Queue außerhalb der Batch-Queues oder einen Status außerhalb von
   `batch.state_types` (eigene Status-Namen kann das Skript nicht prüfen);
   `--no-source-update` ist im Batch-Betrieb nicht erlaubt.
-* Antwortet der Kunde auf ein weitergeleitetes Ticket, öffnet Znuny es wieder, und es liegt erneut in der
-  Batch-Queue. Der nächste Lauf hängt die neuen Artikel an das bestehende Zammad-Ticket an (siehe
-  *Nachträge*) und schließt das Znuny-Ticket wieder.
+* Antwortet der Kunde auf ein weitergeleitetes Ticket, öffnet Znuny es wieder. Liegt es noch in der
+  Batch-Queue (`after_forward` ändert nur den Status), hängt der nächste Lauf die neuen Artikel an das
+  bestehende Zammad-Ticket an (siehe *Nachträge*) und schließt das Znuny-Ticket wieder.
+* Verschiebt `after_forward.queue` die Tickets in eine andere Queue, öffnet Znuny sie bei einer
+  Kundenantwort dort wieder, und `--batch` findet sie nicht (`--check` weist darauf hin). Abhilfe: ein
+  GenericAgent-Job in Znuny, der wieder geöffnete Tickets dieser Queue in die Batch-Queue zurücklegt.
+  Alternativ den Nachtrag von Hand weiterleiten (`php bin/znuny2zammad.php <Ticketnummer>`).
 * Jede Queue wird einzeln durchsucht. Ein falscher Queue-Name blockiert also nicht die anderen
   (`--check` zeigt leere Queues an).
-* Pro Lauf werden höchstens `batch.limit` neue Tickets verarbeitet, je Queue die ältesten zuerst.
+* Pro Lauf werden höchstens `batch.limit` neue Tickets verarbeitet: die Queues in der Reihenfolge von
+  `batch.queues`, je Queue die ältesten zuerst.
 * Eine Sperrdatei neben der Statusdatei verhindert, dass zwei Läufe gleichzeitig arbeiten. Läuft schon
   einer, endet der nächste ohne Fehler.
 

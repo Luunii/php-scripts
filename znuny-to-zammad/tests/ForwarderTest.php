@@ -6,6 +6,7 @@ namespace Znuny2Zammad\Tests;
 
 use Znuny2Zammad\ApiException;
 use Znuny2Zammad\Forwarder;
+use Znuny2Zammad\Http\HttpResponse;
 use Znuny2Zammad\Logger;
 use Znuny2Zammad\StateStore;
 use Znuny2Zammad\ZammadClient;
@@ -698,22 +699,17 @@ final class ForwarderTest extends TestCase
             'ArticleID' => '140', 'SenderType' => 'customer', 'CommunicationChannel' => 'Email', 'IsVisibleForCustomer' => '1',
             'From' => 'max.muster@acme.example', 'To' => 'support@firma.example', 'Subject' => 'Re', 'Body' => 'Noch da?',
         ];
-        // Nach dem Anhangen bricht der Lauf ab (Statusliste von Zammad nicht abrufbar).
-        $calls = 0;
-        $this->servers->http->on('GET', '~/api/v1/ticket_states\?~', static function (array $request) use (&$calls) {
-            $calls++;
-            if ($calls === 1) {
-                return FakeServers::error(503, 'Service Unavailable');
-            }
-
-            return strpos($request['url'], 'page=1') === false ? [] : [['id' => 2, 'name' => 'open', 'state_type' => 'open'], ['id' => 4, 'name' => 'closed', 'state_type' => 'closed']];
-        });
-        $patches = count($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'));
-        $this->assertThrows(ApiException::class, function (): void {
+        // Nach dem Anhaengen bricht der Lauf ab (z. B. Prozess beendet), bevor Znuny aktualisiert ist.
+        $this->servers->znunyUpdateHandler = static function () {
+            throw new \RuntimeException('Prozess beendet');
+        };
+        $this->assertThrows(\RuntimeException::class, function (): void {
             $this->forwarder()->forward(4711);
-        }, '503');
+        }, 'Prozess beendet');
         $this->assertSame([140], $this->state()['pending_followup_ids']);
         $this->assertFalse($this->state()['source_updated']);
+        $this->servers->znunyUpdateHandler = null;
+        $patches = count($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'));
 
         // Naechster Lauf: Artikel ist schon in Zammad, Notiz und Status in Znuny werden nachgeholt.
         $result = $this->forwarder()->forward(4711);
@@ -787,6 +783,66 @@ final class ForwarderTest extends TestCase
         }))[0];
         $this->assertSame('note', $article['type'], 'Gruppe ohne E-Mail-Adresse: Zammad wuerde den E-Mail-Artikel ablehnen');
         $this->assertSame('Users', $this->state()['zammad_group']);
+    }
+
+    public function testResumeDoesNotNeedCustomerLookup(): void
+    {
+        // Abbruch nach dem Anlegen (Artikel 102 scheitert) ...
+        $this->servers->failArticleCall[1] = static function () {
+            return FakeServers::error(503, 'Service Unavailable');
+        };
+        try {
+            $this->forwarder()->forward(4711);
+        } catch (ApiException $e) {
+        }
+        // ... inzwischen hat das Znuny-Ticket einen Kunden, den es in Zammad nicht gibt.
+        $this->servers->znunyTicket['CustomerUserID'] = 'neu@example.com';
+        $searches = count($this->servers->http->requestsMatching('GET', '~/api/v1/users/search~'));
+
+        $this->assertSame('resumed', $this->forwarder(['zammad' => ['create_customers' => false]])->forward(4711)['status']);
+        $this->assertCount($searches, $this->servers->http->requestsMatching('GET', '~/api/v1/users/search~'), 'Kunde wird nur zum Anlegen gebraucht');
+    }
+
+    public function testTransientReopenFailureIsRetried(): void
+    {
+        $this->forwarder()->forward(4711);
+        $this->servers->tickets[55]['state_id'] = 4;
+        $this->servers->znunyTicket['Article'][] = [
+            'ArticleID' => '132', 'SenderType' => 'customer', 'CommunicationChannel' => 'Email', 'IsVisibleForCustomer' => '1',
+            'From' => 'max.muster@acme.example', 'To' => 'support@firma.example', 'Subject' => 'Re', 'Body' => 'Hallo?',
+        ];
+        // Wiederoeffnen scheitert voruebergehend.
+        $this->servers->ticketUpdateHandler = static function () {
+            return FakeServers::error(503, 'Service Unavailable');
+        };
+        $this->assertThrows(ApiException::class, function (): void {
+            $this->forwarder()->forward(4711);
+        }, '503');
+
+        $this->servers->ticketUpdateHandler = null;
+        $this->assertSame('followup', $this->forwarder()->forward(4711)['status']);
+        $this->assertSame(2, $this->servers->tickets[55]['state_id'], 'Zammad-Ticket beim naechsten Lauf wieder geoeffnet');
+        $copies = array_filter($this->servers->sentArticles(), static function (array $article): bool {
+            return ($article['preferences']['znuny_article_id'] ?? 0) === 132;
+        });
+        $this->assertCount(1, $copies);
+    }
+
+    public function testMalformedSuccessResponseDoesNotSkipArticle(): void
+    {
+        // Ein Proxy liefert fuer Artikel 102 eine Seite mit Status 200 - in Zammad kommt nichts an.
+        $this->servers->failArticleCall[1] = static function () {
+            return new HttpResponse(200, '<html><body>Bitte warten ...</body></html>');
+        };
+        $this->assertThrows(ApiException::class, function (): void {
+            $this->forwarder()->forward(4711);
+        }, 'keine gueltige JSON-Antwort');
+
+        $this->assertSame('resumed', $this->forwarder()->forward(4711)['status']);
+        $copies = array_filter($this->servers->sentArticles(), static function (array $article): bool {
+            return ($article['preferences']['znuny_article_id'] ?? 0) === 102;
+        });
+        $this->assertCount(1, $copies, 'Artikel 102 wird nicht als erledigt uebersprungen');
     }
 
     public function testCustomerStoredWithPunycodeIsFound(): void

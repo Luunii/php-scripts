@@ -85,13 +85,18 @@ final class Forwarder
             throw new \RuntimeException(sprintf('Znuny-Ticket %s: keine Artikel zum Weiterleiten gefunden.', $number));
         }
 
-        // Zielgruppe, Status, Prioritaet, Besitzer, Kunde bestimmen.
-        $group = $this->resolveGroup($ticket, isset($options['group']) ? (string) $options['group'] : null);
-        $groupHasEmail = !empty($group['email_address_id']);
+        // Zielgruppe, Status, Prioritaet, Besitzer, Kunde bestimmen. Gibt es das Zammad-Ticket schon
+        // (abgebrochener Lauf), zaehlt seine tatsaechliche Gruppe - Konfiguration oder Agenten koennen
+        // sie seitdem geaendert haben. Kunde, Prioritaet, Besitzer und dynamische Felder braucht es
+        // nur zum Anlegen; ihre Pruefung soll das Fortsetzen nicht blockieren.
+        $hasZammadTicket = $entry !== null && !empty($entry['zammad_ticket_id']);
+        $actualGroup     = $hasZammadTicket ? $this->ticketGroup((int) $entry['zammad_ticket_id']) : null;
+        $group           = $actualGroup ?? $this->resolveGroup($ticket, isset($options['group']) ? (string) $options['group'] : null);
+        $groupHasEmail   = !empty($group['email_address_id']);
         [$zammadState, $pendingTime] = $this->resolveState($ticket);
-        $priority = $this->resolvePriority($ticket, $warnings);
-        $ownerId  = $this->resolveOwner($ticket, $warnings);
-        $customer = $this->resolveCustomer($ticket, $allArticles, isset($options['customer']) ? (string) $options['customer'] : null);
+        $priority = $hasZammadTicket ? null : $this->resolvePriority($ticket, $warnings);
+        $ownerId  = $hasZammadTicket ? null : $this->resolveOwner($ticket, $warnings);
+        $customer = $hasZammadTicket ? null : $this->resolveCustomer($ticket, $allArticles, isset($options['customer']) ? (string) $options['customer'] : null);
 
         $converted = [];
         foreach ($articles as $article) {
@@ -102,40 +107,52 @@ final class Forwarder
             $converted[] = ['id' => (int) ($article['ArticleID'] ?? 0), 'payload' => $item['payload']];
         }
 
-        $ticketPayload = [
-            'title'       => $this->title($ticket),
-            'group_id'    => (int) $group['id'],
-            'state_id'    => (int) $zammadState['id'],
-            'priority_id' => (int) $priority['id'],
-        ];
-        if ($pendingTime !== null) {
-            $ticketPayload['pending_time'] = $pendingTime;
+        $tags          = $this->tags($number);
+        $ticketPayload = [];
+        if (!$hasZammadTicket) {
+            $ticketPayload = [
+                'title'       => $this->title($ticket),
+                'group_id'    => (int) $group['id'],
+                'state_id'    => (int) $zammadState['id'],
+                'priority_id' => (int) $priority['id'],
+            ];
+            if ($pendingTime !== null) {
+                $ticketPayload['pending_time'] = $pendingTime;
+            }
+            if ($ownerId !== null) {
+                $ticketPayload['owner_id'] = $ownerId;
+            }
+            if (isset($customer['id'])) {
+                $ticketPayload['customer_id'] = (int) $customer['id'];
+            } else {
+                // Zammad sucht den Kunden per E-Mail und legt ihn bei Bedarf an.
+                $ticketPayload['customer'] = array_filter([
+                    'email'     => $customer['email'],
+                    'firstname' => $customer['firstname'],
+                    'lastname'  => $customer['lastname'],
+                ], 'strlen');
+            }
+            if ($tags !== '') {
+                $ticketPayload['tags'] = $tags;
+            }
+            $ticketPayload += $this->dynamicFields($ticket, $warnings);
         }
-        if ($ownerId !== null) {
-            $ticketPayload['owner_id'] = $ownerId;
-        }
-        if (isset($customer['id'])) {
-            $ticketPayload['customer_id'] = (int) $customer['id'];
-        } else {
-            // Zammad sucht den Kunden per E-Mail und legt ihn bei Bedarf an.
-            $ticketPayload['customer'] = array_filter([
-                'email'     => $customer['email'],
-                'firstname' => $customer['firstname'],
-                'lastname'  => $customer['lastname'],
-            ], 'strlen');
-        }
-        $tags = $this->tags($number);
-        if ($tags !== '') {
-            $ticketPayload['tags'] = $tags;
-        }
-        $ticketPayload += $this->dynamicFields($ticket, $warnings);
 
         foreach ($warnings as $warning) {
             $this->logger->warn(sprintf('Znuny-Ticket %s: %s', $number, $warning));
         }
 
         if ($dryRun) {
-            $this->printPlan($ticket, $group, $zammadState, $priority, $customer, $converted, $ticketPayload);
+            if ($hasZammadTicket) {
+                $this->logger->info(sprintf(
+                    'Trockenlauf: Znuny-Ticket %s - die abgebrochene Weiterleitung an Zammad #%s wuerde fortgesetzt (%d Artikel, bereits uebertragene werden uebersprungen).',
+                    $number,
+                    $entry['zammad_ticket_number'] ?? '?',
+                    count($converted)
+                ));
+            } else {
+                $this->printPlan($ticket, $group, $zammadState, $priority, $customer, $converted, $ticketPayload);
+            }
 
             return ['status' => 'dry-run', 'znuny_ticket_number' => $number, 'warnings' => $warnings];
         }
@@ -145,24 +162,28 @@ final class Forwarder
         if ($entry !== null && empty($entry['zammad_ticket_id'])) {
             // Der letzte Versuch brach beim Anlegen ab (z. B. Zeitueberschreitung) - vielleicht
             // hat Zammad das Ticket trotzdem angelegt. Dann dieses Ticket uebernehmen.
-            $pending = $entry;
-            $entry   = $this->adoptInterruptedCreate($key, $number, $entry, (string) $group['name']);
+            $pending     = $entry;
+            $entry       = $this->adoptInterruptedCreate($key, $number, $entry, (string) $group['name']);
+            $actualGroup = $entry !== null ? $this->ticketGroup((int) $entry['zammad_ticket_id']) : null;
+            if ($actualGroup !== null && !empty($actualGroup['email_address_id']) !== $groupHasEmail) {
+                // Das uebernommene Ticket liegt in einer Gruppe mit anderer E-Mail-Faehigkeit.
+                $groupHasEmail = !empty($actualGroup['email_address_id']);
+                $converted     = [];
+                foreach ($articles as $article) {
+                    $item = $converter->convert($article, $groupHasEmail);
+                    foreach (array_diff($item['warnings'], $warnings) as $warning) {
+                        $warnings[] = $warning;
+                        $this->logger->warn(sprintf('Znuny-Ticket %s: %s', $number, $warning));
+                    }
+                    $converted[] = ['id' => (int) ($article['ArticleID'] ?? 0), 'payload' => $item['payload']];
+                }
+            }
         }
         $resumed = $entry !== null;
         $expectedTags = $tags !== '' ? explode(',', $tags) : [];
         if ($resumed) {
             $zammadTicketId = (int) $entry['zammad_ticket_id'];
             $this->logger->info(sprintf('Znuny-Ticket %s: setze abgebrochene Weiterleitung fort (Zammad #%s).', $number, $entry['zammad_ticket_number'] ?? $zammadTicketId));
-            // Das Ticket liegt in seiner tatsaechlichen Gruppe (Konfiguration oder Agenten koennen
-            // sie seit dem Abbruch geaendert haben) - deren E-Mail-Adresse ist massgeblich.
-            $actualGroup = $this->zammad->findGroupById((int) ($this->zammad->getTicket($zammadTicketId)['group_id'] ?? 0));
-            if ($actualGroup !== null && !empty($actualGroup['email_address_id']) !== $groupHasEmail) {
-                $groupHasEmail = !empty($actualGroup['email_address_id']);
-                $converted     = [];
-                foreach ($articles as $article) {
-                    $converted[] = ['id' => (int) ($article['ArticleID'] ?? 0), 'payload' => $converter->convert($article, $groupHasEmail)['payload']];
-                }
-            }
             if ($actualGroup !== null) {
                 $entry['zammad_group'] = (string) $actualGroup['name'];
             }
@@ -405,6 +426,35 @@ final class Forwarder
         $existing     = $this->articlesInZammad($zammadTicketId)['articles'];
         $warnings     = [];
         $customer     = false;
+        foreach ($new as $article) {
+            $customer = $customer || ArticleConverter::senderType($article) === 'customer';
+        }
+
+        // Geschlossenes Zammad-Ticket wieder oeffnen, wenn der Kunde geschrieben hat - vor dem
+        // Anhaengen: danach gaebe es keine neuen Artikel mehr, die einen zweiten Versuch ausloesen.
+        $state = $this->zammad->findStateById((int) ($zammadTicket['state_id'] ?? 0));
+        if ($customer && $state !== null && ($state['state_type'] ?? '') === 'closed') {
+            $followUpState = (string) ($this->config['zammad']['followup_state'] ?? 'open');
+            $reopen        = $this->zammad->findState($followUpState);
+            $warning       = null;
+            if ($reopen === null) {
+                $warning = sprintf('Zammad-Status "%s" (zammad.followup_state) nicht gefunden - Zammad-Ticket #%s bleibt trotz Kundenantwort geschlossen.', $followUpState, $entry['zammad_ticket_number'] ?? '?');
+            } else {
+                try {
+                    $this->zammad->updateTicket($zammadTicketId, ['state_id' => (int) $reopen['id']]);
+                } catch (ApiException $e) {
+                    // Voruebergehende Fehler (Netz, 5xx): der naechste Lauf wiederholt den ganzen Nachtrag.
+                    if ($e->getCode() === 0 || $e->getCode() >= 500) {
+                        throw $e;
+                    }
+                    $warning = sprintf('Zammad-Ticket #%s konnte nicht wieder geoeffnet werden: %s', $entry['zammad_ticket_number'] ?? '?', $e->getMessage());
+                }
+            }
+            if ($warning !== null) {
+                $warnings[] = $warning;
+                $this->logger->warn(sprintf('Znuny-Ticket %s: %s', $number, $warning));
+            }
+        }
 
         // Vorher vermerken, dass Znuny danach Notiz/Status braucht: bricht der Lauf nach dem
         // Anhaengen ab, holt der naechste Lauf das nach (die Artikel gelten dann schon als erledigt).
@@ -430,30 +480,8 @@ final class Forwarder
                 // Neue Artikel sollen die zustaendigen Zammad-Agenten erreichen - nicht unterdruecken.
                 $this->zammad->createArticle(['ticket_id' => $zammadTicketId] + $item['payload'], false);
             }
-            $customer = $customer || ArticleConverter::senderType($article) === 'customer';
             $entry['articles_done'][] = $id;
             $this->state->set($key, $entry);
-        }
-
-        // Geschlossenes Zammad-Ticket wieder oeffnen, wenn der Kunde geschrieben hat.
-        $state = $this->zammad->findStateById((int) ($zammadTicket['state_id'] ?? 0));
-        if ($customer && $state !== null && ($state['state_type'] ?? '') === 'closed') {
-            $followUpState = (string) ($this->config['zammad']['followup_state'] ?? 'open');
-            $reopen        = $this->zammad->findState($followUpState);
-            $warning       = null;
-            if ($reopen === null) {
-                $warning = sprintf('Zammad-Status "%s" (zammad.followup_state) nicht gefunden - Zammad-Ticket #%s bleibt trotz Kundenantwort geschlossen.', $followUpState, $entry['zammad_ticket_number'] ?? '?');
-            } else {
-                try {
-                    $this->zammad->updateTicket($zammadTicketId, ['state_id' => (int) $reopen['id']]);
-                } catch (ApiException $e) {
-                    $warning = sprintf('Zammad-Ticket #%s konnte nicht wieder geoeffnet werden: %s', $entry['zammad_ticket_number'] ?? '?', $e->getMessage());
-                }
-            }
-            if ($warning !== null) {
-                $warnings[] = $warning;
-                $this->logger->warn(sprintf('Znuny-Ticket %s: %s', $number, $warning));
-            }
         }
 
         $entry['znuny_last_article_id'] = self::maxArticleId($all);
@@ -688,6 +716,16 @@ final class Forwarder
         $this->state->set($key, $adopted);
 
         return $adopted;
+    }
+
+    /**
+     * Aktuelle Gruppe eines vorhandenen Zammad-Tickets.
+     *
+     * @return array<string,mixed>|null
+     */
+    private function ticketGroup(int $zammadTicketId): ?array
+    {
+        return $this->zammad->findGroupById((int) ($this->zammad->getTicket($zammadTicketId)['group_id'] ?? 0));
     }
 
     /**
