@@ -16,6 +16,10 @@ namespace Znuny2Zammad;
  */
 final class Forwarder
 {
+    /** Info-Notiz: Zeichen je Wert und fuer die ganze Notiz (Zammad-Grenze fuer Artikel: 1.500.000). */
+    private const INFO_VALUE_LIMIT = 5000;
+    private const INFO_NOTE_LIMIT  = 500000;
+
     /** @var ZnunyClient */
     private $znuny;
 
@@ -77,12 +81,24 @@ final class Forwarder
         $forward  = $this->config['forward'];
         $warnings = [];
 
-        $converter   = $this->converter($forward);
-        $allArticles = array_values(array_filter((array) ($ticket['Article'] ?? []), 'is_array'));
+        $converter    = $this->converter($forward);
+        $allArticles  = array_values(array_filter((array) ($ticket['Article'] ?? []), 'is_array'));
         $maxArticleId = self::maxArticleId($allArticles);
-        $articles    = $converter->selectArticles($ticket);
+        // Notizen dieses Skripts (z. B. von einer Weiterleitung vor --force) gehoeren nicht zum Verlauf.
+        $articles = $converter->selectArticles(['Article' => array_values(array_filter($allArticles, function (array $article): bool {
+            return $this->bridgeNoteTarget($article) === null;
+        }))] + $ticket);
         if ($articles === []) {
             throw new \RuntimeException(sprintf('Znuny-Ticket %s: keine Artikel zum Weiterleiten gefunden.', $number));
+        }
+
+        // Brach der letzte Versuch beim Anlegen ab (z. B. Zeitueberschreitung), hat Zammad das Ticket
+        // vielleicht trotzdem angelegt - dann dieses Ticket uebernehmen. Das geschieht vor allen
+        // Pruefungen, die nur zum Anlegen noetig sind (im Trockenlauf ohne zu speichern).
+        $pending = null;
+        if ($entry !== null && empty($entry['zammad_ticket_id'])) {
+            $pending = $entry;
+            $entry   = $this->adoptInterruptedCreate($key, $number, $entry, !$dryRun);
         }
 
         // Zielgruppe, Status, Prioritaet, Besitzer, Kunde bestimmen. Gibt es das Zammad-Ticket schon
@@ -158,27 +174,6 @@ final class Forwarder
         }
 
         // Anlegen bzw. abgebrochenen Lauf fortsetzen.
-        $pending = null;
-        if ($entry !== null && empty($entry['zammad_ticket_id'])) {
-            // Der letzte Versuch brach beim Anlegen ab (z. B. Zeitueberschreitung) - vielleicht
-            // hat Zammad das Ticket trotzdem angelegt. Dann dieses Ticket uebernehmen.
-            $pending     = $entry;
-            $entry       = $this->adoptInterruptedCreate($key, $number, $entry, (string) $group['name']);
-            $actualGroup = $entry !== null ? $this->ticketGroup((int) $entry['zammad_ticket_id']) : null;
-            if ($actualGroup !== null && !empty($actualGroup['email_address_id']) !== $groupHasEmail) {
-                // Das uebernommene Ticket liegt in einer Gruppe mit anderer E-Mail-Faehigkeit.
-                $groupHasEmail = !empty($actualGroup['email_address_id']);
-                $converted     = [];
-                foreach ($articles as $article) {
-                    $item = $converter->convert($article, $groupHasEmail);
-                    foreach (array_diff($item['warnings'], $warnings) as $warning) {
-                        $warnings[] = $warning;
-                        $this->logger->warn(sprintf('Znuny-Ticket %s: %s', $number, $warning));
-                    }
-                    $converted[] = ['id' => (int) ($article['ArticleID'] ?? 0), 'payload' => $item['payload']];
-                }
-            }
-        }
         $resumed = $entry !== null;
         $expectedTags = $tags !== '' ? explode(',', $tags) : [];
         if ($resumed) {
@@ -513,17 +508,10 @@ final class Forwarder
      */
     private function reconcileOwnNotes(string $key, array $entry, array $articles): array
     {
-        $subject = (string) ($this->config['znuny']['after_forward']['note_subject'] ?? 'Ticket an Zammad weitergeleitet');
-        $url     = $this->zammad->ticketUrl((int) $entry['zammad_ticket_id']);
-        $known   = array_map('intval', (array) ($entry['znuny_note_ids'] ?? []));
-        $found   = [];
+        $known = array_map('intval', (array) ($entry['znuny_note_ids'] ?? []));
+        $found = [];
         foreach ($articles as $article) {
-            if (
-                ArticleConverter::senderType($article) === 'agent'
-                && !ArticleConverter::isVisibleForCustomer($article)
-                && trim((string) ($article['Subject'] ?? '')) === trim($subject)
-                && strpos((string) ($article['Body'] ?? ''), $url) !== false
-            ) {
+            if ($this->bridgeNoteTarget($article) === (int) $entry['zammad_ticket_id']) {
                 $found[] = (int) ($article['ArticleID'] ?? 0);
             }
         }
@@ -540,6 +528,26 @@ final class Forwarder
         $this->state->set($key, $entry);
 
         return $entry;
+    }
+
+    /**
+     * Ist der Artikel eine Notiz dieses Skripts (intern, Betreff aus after_forward.note_subject,
+     * Link auf ein Ticket dieser Zammad-Instanz), liefert dies die ID des verlinkten Zammad-Tickets.
+     *
+     * @param array<string,mixed> $article
+     */
+    private function bridgeNoteTarget(array $article): ?int
+    {
+        $subject = (string) ($this->config['znuny']['after_forward']['note_subject'] ?? 'Ticket an Zammad weitergeleitet');
+        if (
+            ArticleConverter::senderType($article) !== 'agent'
+            || ArticleConverter::isVisibleForCustomer($article)
+            || trim((string) ($article['Subject'] ?? '')) !== trim($subject)
+        ) {
+            return null;
+        }
+
+        return $this->zammad->ticketIdFromText((string) ($article['Body'] ?? ''));
     }
 
     /**
@@ -655,11 +663,12 @@ final class Forwarder
     /**
      * Sucht nach einem abgebrochenen Anlegen das Ticket in Zammad (ueber den Tag znuny-<Nummer>).
      *
-     * @param array<string,mixed> $entry Vermerk ohne zammad_ticket_id
+     * @param array<string,mixed> $entry   Vermerk ohne zammad_ticket_id
+     * @param bool                $persist Eintrag des gefundenen Tickets speichern (nicht im Trockenlauf)
      *
      * @return array<string,mixed>|null Eintrag des gefundenen Tickets oder null (= neu anlegen)
      */
-    private function adoptInterruptedCreate(string $key, string $number, array $entry, string $groupName): ?array
+    private function adoptInterruptedCreate(string $key, string $number, array $entry, bool $persist): ?array
     {
         $since = (string) ($entry['create_started_at'] ?? '?');
         if (empty($this->config['zammad']['tag_ticket_number'])) {
@@ -698,12 +707,13 @@ final class Forwarder
         }
 
         $ticket = $this->zammad->getTicket($ids[0]);
-        $this->logger->info(sprintf('Znuny-Ticket %s: Zammad-Ticket #%s aus dem unterbrochenen Lauf gefunden, setze fort.', $number, $ticket['number'] ?? $ids[0]));
+        $group  = $this->zammad->findGroupById((int) ($ticket['group_id'] ?? 0));
+        $this->logger->info(sprintf('Znuny-Ticket %s: Zammad-Ticket #%s aus dem unterbrochenen Lauf gefunden.', $number, $ticket['number'] ?? $ids[0]));
         $adopted = [
             'znuny_ticket_number'  => $number,
             'zammad_ticket_id'     => $ids[0],
             'zammad_ticket_number' => (string) ($ticket['number'] ?? ''),
-            'zammad_group'         => $groupName,
+            'zammad_group'         => (string) ($group['name'] ?? ''),
             'articles_done'        => [],
             'info_note_done'       => false,
             'complete'             => false,
@@ -713,7 +723,9 @@ final class Forwarder
         if ($known !== []) {
             $adopted['earlier_zammad_ticket_ids'] = $known;
         }
-        $this->state->set($key, $adopted);
+        if ($persist) {
+            $this->state->set($key, $adopted);
+        }
 
         return $adopted;
     }
@@ -1188,14 +1200,28 @@ final class Forwarder
             }
         }
 
-        $html = '<p><strong>Dieses Ticket wurde aus Znuny weitergeleitet.</strong></p><table>';
+        // Lange Werte kuerzen und die Notiz begrenzen, sonst lehnt Zammad sie bei jedem Versuch ab.
+        $html    = '<p><strong>Dieses Ticket wurde aus Znuny weitergeleitet.</strong></p><table>';
+        $omitted = 0;
         foreach ($rows as $label => $value) {
-            if ((string) $value === '') {
+            $value = (string) $value;
+            if ($value === '') {
                 continue;
             }
-            $html .= '<tr><td><strong>' . self::e((string) $label) . '</strong></td><td>' . self::e((string) $value) . '</td></tr>';
+            if (mb_strlen($value) > self::INFO_VALUE_LIMIT) {
+                $value = mb_substr($value, 0, self::INFO_VALUE_LIMIT) . ' [... gekuerzt]';
+            }
+            $row = '<tr><td><strong>' . self::e((string) $label) . '</strong></td><td>' . self::e($value) . '</td></tr>';
+            if (mb_strlen($html) + mb_strlen($row) > self::INFO_NOTE_LIMIT) {
+                $omitted++;
+                continue;
+            }
+            $html .= $row;
         }
         $html .= '</table>';
+        if ($omitted > 0) {
+            $html .= '<p>' . $omitted . ' weitere(s) Feld(er) aus Platzgruenden ausgelassen, siehe Znuny.</p>';
+        }
         if ($znunyUrl !== '') {
             $html .= '<p><a href="' . self::e($znunyUrl) . '">Ticket in Znuny öffnen</a></p>';
         }

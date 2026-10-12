@@ -845,6 +845,76 @@ final class ForwarderTest extends TestCase
         $this->assertCount(1, $copies, 'Artikel 102 wird nicht als erledigt uebersprungen');
     }
 
+    public function testInterruptedCreateIsAdoptedBeforeCustomerLookup(): void
+    {
+        // Zammad legt das Ticket an, die Antwort geht verloren ...
+        $this->servers->ticketCreateHandler = function (array $request) {
+            $this->servers->ticketCreateHandler = null;
+            $this->servers->storeTicket(FakeHttpClient::body($request));
+
+            return FakeServers::error(504, 'Gateway Timeout');
+        };
+        try {
+            $this->forwarder()->forward(4711);
+        } catch (ApiException $e) {
+        }
+        // ... und inzwischen hat das Znuny-Ticket einen Kunden, den es in Zammad nicht gibt.
+        $this->servers->znunyTicket['CustomerUserID'] = 'neu@example.com';
+
+        $this->assertSame('resumed', $this->forwarder(['zammad' => ['create_customers' => false]])->forward(4711)['status']);
+        $this->assertCount(1, $this->servers->tickets);
+    }
+
+    public function testInterruptedCreateFindsTicketBehindManyEarlierForwards(): void
+    {
+        // Zwoelf fruehere Weiterleitungen (--force) und das unterbrochen angelegte Ticket tragen denselben Tag.
+        for ($id = 1; $id <= 13; $id++) {
+            $this->servers->tickets[$id] = ['id' => $id, 'number' => (string) (30000 + $id), 'group_id' => 1, 'state_id' => 2, 'tag_list' => ['znuny', 'znuny-2024031210000017']];
+        }
+        file_put_contents($this->stateFile, json_encode([
+            '4711'  => ['znuny_ticket_number' => '2024031210000017', 'create_started_at' => '2026-10-12T10:00:00+00:00', 'complete' => false, 'exclude_ticket_ids' => range(1, 12)],
+            '_meta' => ['ticket_tag_reliable' => true],
+        ]));
+
+        $this->assertSame('resumed', $this->forwarder()->forward(4711)['status']);
+        $this->assertSame(13, $this->state()['zammad_ticket_id']);
+        $this->assertCount(13, $this->servers->tickets, 'kein weiteres Zammad-Ticket');
+    }
+
+    public function testForceDoesNotImportOwnNoteOfEarlierForward(): void
+    {
+        $this->forwarder()->forward(4711);
+        // Die "weitergeleitet"-Notiz des Skripts steht jetzt in Znuny.
+        $this->servers->znunyTicket['Article'][] = [
+            'ArticleID' => '900', 'SenderType' => 'agent', 'CommunicationChannel' => 'Internal', 'IsVisibleForCustomer' => '0',
+            'Subject' => 'Ticket an Zammad weitergeleitet', 'CreateTime' => '2024-03-14 08:00:00',
+            'Body' => "Dieses Ticket wurde an Zammad weitergeleitet.\n\nZammad-Ticket: #31001\nGruppe: Users\nLink: https://zammad.test/#ticket/zoom/55\n",
+        ];
+
+        $this->assertSame('forwarded', $this->forwarder()->forward(4711, ['force' => true])['status']);
+        $copies = array_filter($this->servers->sentArticles(), static function (array $article): bool {
+            return ($article['preferences']['znuny_article_id'] ?? 0) === 900;
+        });
+        $this->assertCount(0, $copies, 'eigene Notiz gehoert nicht in den Verlauf des neuen Tickets');
+    }
+
+    public function testInfoNoteIsBounded(): void
+    {
+        $fields = [];
+        for ($i = 1; $i <= 120; $i++) {
+            $fields[] = ['Name' => 'Feld' . $i, 'Value' => str_repeat('<x>', 3000)];
+        }
+        $this->servers->znunyTicket['DynamicField'] = $fields;
+
+        $this->assertSame('forwarded', $this->forwarder()->forward(4711)['status']);
+        $note = array_values(array_filter($this->servers->sentArticles(), static function (array $article): bool {
+            return !empty($article['preferences']['znuny_info_note']);
+        }))[0];
+        $this->assertTrue(mb_strlen($note['body']) <= 501000, 'Info-Notiz bleibt weit unter der Zammad-Grenze');
+        $this->assertStringContains('[... gekuerzt]', $note['body']);
+        $this->assertStringContains('aus Platzgruenden ausgelassen', $note['body']);
+    }
+
     public function testCustomerStoredWithPunycodeIsFound(): void
     {
         $this->servers->znunyTicket['CustomerUserID'] = 'max@müller.de';

@@ -288,11 +288,21 @@ final class FakeServers
                 return $this->tickets[(int) $m[1]];
             })
             ->on('POST', '~^' . $base . '/api/v1/tickets/search$~', function (array $request) {
-                $tag = FakeHttpClient::body($request)['condition']['ticket.tags']['value'] ?? '';
-
-                return array_values(array_filter($this->tickets, static function (array $ticket) use ($tag): bool {
+                $body  = FakeHttpClient::body($request);
+                $tag   = $body['condition']['ticket.tags']['value'] ?? '';
+                $found = array_values(array_filter($this->tickets, static function (array $ticket) use ($tag): bool {
                     return in_array($tag, $ticket['tag_list'], true);
                 }));
+                if (($body['sort_by'] ?? '') === 'id') {
+                    usort($found, static function (array $a, array $b): int {
+                        return $a['id'] <=> $b['id'];
+                    });
+                }
+                // Wie Zammad: per_page bzw. limit (hoechstens 200, Standard 50), Seiten ab 1.
+                $limit = min(200, (int) ($body['per_page'] ?? $body['limit'] ?? 50));
+                $page  = max(1, (int) ($body['page'] ?? 1));
+
+                return array_slice($found, ($page - 1) * $limit, $limit);
             })
             ->on('GET', '~^' . $base . '/api/v1/tags\?object=Ticket&o_id=\d+$~', function (array $request) {
                 preg_match('~o_id=(\d+)$~', $request['url'], $m);

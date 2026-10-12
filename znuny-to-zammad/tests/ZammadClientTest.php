@@ -106,6 +106,29 @@ final class ZammadClientTest extends TestCase
         }
     }
 
+    public function testFindTicketIdsByTagReadsAllPages(): void
+    {
+        $toTickets = static function (array $ids): array {
+            return array_map(static function (int $id): array {
+                return ['id' => $id];
+            }, $ids);
+        };
+        $http = new FakeHttpClient();
+        $http->on('POST', '~/api/v1/tickets/search$~', static function (array $request) use ($toTickets) {
+            $page = (int) (FakeHttpClient::body($request)['page'] ?? 1);
+
+            return $toTickets($page === 1 ? range(1, 100) : ($page === 2 ? [101, 102] : []));
+        });
+        $this->assertCount(102, $this->client($http)->findTicketIdsByTag('znuny-1'));
+        $this->assertCount(2, $http->requests);
+
+        // Version ohne Seiten: liefert immer dieselbe Seite - keine Endlosschleife.
+        $http = new FakeHttpClient();
+        $http->on('POST', '~/api/v1/tickets/search$~', $toTickets(range(1, 100)));
+        $this->assertCount(100, $this->client($http)->findTicketIdsByTag('znuny-1'));
+        $this->assertCount(2, $http->requests);
+    }
+
     public function testStatesAndPriorities(): void
     {
         $http = new FakeHttpClient();

@@ -245,7 +245,8 @@ weiteres Zammad-Ticket an. Stattdessen:
   erneut angewendet.
 * Gibt es nichts Neues, ändert ein Aufruf von Hand nichts.
 
-Mit `--force` wird dagegen bewusst ein neues Zammad-Ticket angelegt.
+Mit `--force` wird dagegen bewusst ein neues Zammad-Ticket angelegt. Die Notizen des Skripts aus früheren
+Weiterleitungen gehören nicht zum Verlauf und werden dabei nicht übernommen.
 
 ## Doppelte Tickets und Abbrüche
 

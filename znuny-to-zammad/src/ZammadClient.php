@@ -50,6 +50,18 @@ final class ZammadClient
     }
 
     /**
+     * Ticket-ID aus einem Link auf diese Zammad-Instanz (siehe ticketUrl()), sonst null.
+     */
+    public function ticketIdFromText(string $text): ?int
+    {
+        if (preg_match('~' . preg_quote($this->baseUrl . '/#ticket/zoom/', '~') . '(\d+)~', $text, $m)) {
+            return (int) $m[1];
+        }
+
+        return null;
+    }
+
+    /**
      * @return array<string,mixed>
      */
     public function me(): array
@@ -167,25 +179,40 @@ final class ZammadClient
      */
     public function findTicketIdsByTag(string $tag): array
     {
-        $data = $this->request('POST', '/api/v1/tickets/search', [
-            'condition' => ['ticket.tags' => ['operator' => 'contains all', 'value' => $tag]],
-            'limit'     => 10,
-        ]);
+        // Seitenweise: Tickets frueherer Weiterleitungen (--force) tragen denselben Tag und
+        // duerfen ein neues nicht aus dem Ergebnis verdraengen.
+        $perPage = 100;
+        $ids     = [];
+        for ($page = 1; $page <= 50; $page++) {
+            $data = $this->request('POST', '/api/v1/tickets/search', [
+                'condition' => ['ticket.tags' => ['operator' => 'contains all', 'value' => $tag]],
+                'sort_by'   => 'id',
+                'order_by'  => 'asc',
+                'limit'     => $perPage,
+                'page'      => $page,
+            ]);
 
-        // Zammad 7: Liste von Tickets; aeltere Versionen: {"tickets": [IDs], ...}
-        $items = [];
-        if (is_array($data)) {
+            // Zammad 7: Liste von Tickets; aeltere Versionen: {"tickets": [IDs], ...}
             $items = $data['tickets'] ?? $data['record_ids'] ?? $data['records'] ?? $data;
-        }
-        $ids = [];
-        foreach ((array) $items as $item) {
-            $id = is_array($item) ? (int) ($item['id'] ?? 0) : (int) $item;
-            if ($id > 0) {
-                $ids[] = $id;
+            $count = 0;
+            $added = 0;
+            foreach ((array) $items as $item) {
+                $id = is_array($item) ? (int) ($item['id'] ?? 0) : (int) $item;
+                if ($id > 0) {
+                    $count++;
+                    if (!isset($ids[$id])) {
+                        $ids[$id] = true;
+                        $added++;
+                    }
+                }
+            }
+            // Letzte Seite - oder eine Version ohne Seiten, die immer dieselbe Seite liefert.
+            if ($count < $perPage || $added === 0) {
+                break;
             }
         }
 
-        return array_values(array_unique($ids));
+        return array_keys($ids);
     }
 
     /**
