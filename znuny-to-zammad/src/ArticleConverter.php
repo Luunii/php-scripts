@@ -291,7 +291,11 @@ final class ArticleConverter
             if ($html !== null && trim(strip_tags($html, '<img>')) !== '') {
                 // 1. Versuch: Inline-Bilder einbetten (im Rahmen der Groessengrenzen).
                 $used     = [$htmlIndex];
-                $embedded = $this->embedInlineImages($html, $attachments, $used);
+                // Mit forward.attachments = false auch keine Bilder einbetten (Zammad macht daraus Anhaenge);
+                // sie werden dann wie andere Anhaenge als "nicht uebernommen" aufgefuehrt.
+                $embedded = ($this->options['attachments'] ?? true)
+                    ? $this->embedInlineImages($html, $attachments, $used)
+                    : $html;
                 if (self::zammadBodyLength($embedded) <= self::BODY_LIMIT) {
                     return ['body' => $embedded, 'content_type' => 'text/html', 'used' => $used];
                 }

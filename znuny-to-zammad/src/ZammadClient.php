@@ -82,6 +82,20 @@ final class ZammadClient
     }
 
     /**
+     * @return array<string,mixed>|null
+     */
+    public function findGroupById(int $id): ?array
+    {
+        foreach ($this->groups() as $group) {
+            if ((int) ($group['id'] ?? 0) === $id) {
+                return $group;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * @return array<string,mixed>|null inkl. "state_type" (Name des Statustyps)
      */
     public function findState(string $name): ?array

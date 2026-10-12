@@ -147,6 +147,7 @@ final class CliTest extends TestCase
         $this->assertStringContains('2 bereits weitergeleitete(s) Ticket(s) wieder in der Batch-Queue', $this->output);
 
         $state = json_decode((string) file_get_contents($this->stateFile), true);
+        unset($state['_meta']);
         $this->assertSame(['4711', '4712', '4713'], array_map('strval', array_keys($state)));
         $this->assertCount(3, $this->servers->http->requestsMatching('POST', '~/api/v1/tickets$~'));
     }
@@ -192,6 +193,14 @@ final class CliTest extends TestCase
         $this->writeConfig(['log_file' => 123]);
         $this->assertSame(Cli::EXIT_USAGE, $this->run(['--check']));
         $this->assertStringContains('log_file muss ein Text', $this->output);
+    }
+
+    public function testCheckCoversGroupsDerivedFromBatchQueues(): void
+    {
+        $this->writeConfig(['zammad' => ['group_from_queue' => true], 'batch' => ['queues' => ['Archiv', 'Ohne Gruppe']]]);
+        $this->assertSame(Cli::EXIT_ERROR, $this->run(['--check']));
+        $this->assertStringContains('Gruppe fuer Batch-Queue "Archiv" "Archiv" ist deaktiviert', $this->output);
+        $this->assertStringContains('keine Gruppe "Ohne Gruppe" - Tickets aus dieser Batch-Queue gehen in die Standardgruppe', $this->output);
     }
 
     public function testCheckWarnsAboutMissingGroupRights(): void

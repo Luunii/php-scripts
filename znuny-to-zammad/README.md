@@ -224,7 +224,8 @@ weiteres Zammad-Ticket an. Stattdessen:
 * Neue Znuny-Artikel seit der Weiterleitung (z. B. eine Kundenantwort) werden an das bestehende
   Zammad-Ticket angehängt. Die eigenen „weitergeleitet“-Notizen des Skripts sind davon ausgenommen.
 * Ist das Zammad-Ticket schon geschlossen und hat der Kunde geschrieben, wird es wieder geöffnet
-  (`zammad.followup_state`, Standard `open`).
+  (`zammad.followup_state`, Standard `open`). Maßgeblich ist die aktuelle Gruppe des Zammad-Tickets,
+  falls Agenten es inzwischen verschoben haben.
 * In Znuny kommt eine Notiz „Nachtrag: … Artikel an Zammad übertragen“ dazu, und `after_forward` wird
   erneut angewendet.
 * Gibt es nichts Neues, ändert ein Aufruf von Hand nichts.
@@ -243,8 +244,11 @@ In `var/state.json` hält das Skript fest, welche Tickets schon weitergeleitet w
 * Bricht das Anlegen selbst ab (z. B. Zeitüberschreitung, obwohl Zammad das Ticket schon gespeichert
   hat), sucht der nächste Aufruf zuerst in Zammad nach dem Tag `znuny-<Nummer>` und übernimmt das
   gefundene Ticket. Tickets aus früheren Weiterleitungen (`--force`) werden dabei nicht verwechselt.
-  Ohne verlässlichen Tag (`tag_ticket_number => false` oder Zammad setzt ihn nicht) bittet das Skript
-  um eine manuelle Prüfung.
+  Findet es nichts, legt es nur dann neu an, wenn bestätigt ist, dass Zammad den Tag setzt (das wird
+  nach der ersten erfolgreichen Weiterleitung festgestellt). Sonst, und bei `tag_ticket_number => false`,
+  bittet es um eine manuelle Prüfung.
+* Geht die Antwort auf die Znuny-Notiz verloren, obwohl Znuny sie gespeichert hat, erkennt der nächste
+  Lauf die Notiz und schreibt sie nicht noch einmal.
 * Lehnt Zammad ein `--force`-Anlegen ab (z. B. 422), bleibt die frühere Weiterleitung gespeichert.
 
 ## Bekannte Einschränkungen

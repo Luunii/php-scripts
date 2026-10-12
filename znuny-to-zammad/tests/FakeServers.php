@@ -52,6 +52,9 @@ final class FakeServers
     /** @var callable|null Handler fuer POST /api/v1/tickets (vor der Standardlogik) */
     public $ticketCreateHandler;
 
+    /** @var callable|null Handler fuer PUT /api/v1/tickets/{id} (vor der Standardlogik) */
+    public $ticketUpdateHandler;
+
     /** @var array<int,array<string,mixed>> */
     public $priorities = [
         ['id' => 1, 'name' => '1 low', 'active' => true],
@@ -265,6 +268,12 @@ final class FakeServers
                 return $this->tickets[(int) $m[1]] ?? FakeHttpClient::json(['error' => 'not found'], 404);
             })
             ->on('PUT', '~^' . $base . '/api/v1/tickets/\d+$~', function (array $request) {
+                if ($this->ticketUpdateHandler !== null) {
+                    $response = ($this->ticketUpdateHandler)($request);
+                    if ($response !== null) {
+                        return $response;
+                    }
+                }
                 preg_match('~/(\d+)$~', $request['url'], $m);
                 $body = FakeHttpClient::body($request);
                 if (($body['state_id'] ?? null) === 1) {

@@ -580,6 +580,117 @@ final class ForwarderTest extends TestCase
         $this->assertCount(2, $this->servers->tickets, 'kein drittes Ticket');
     }
 
+    public function testFirstInterruptedCreateWithUnconfirmedTagNeedsManualCheck(): void
+    {
+        // Allererste Weiterleitung: Zammad speichert das Ticket, verwirft den Tag, die Antwort geht verloren.
+        $this->servers->ticketCreateHandler = function (array $request) {
+            $this->servers->ticketCreateHandler = null;
+            $body = FakeHttpClient::body($request);
+            unset($body['tags']);
+            $this->servers->storeTicket($body);
+
+            return FakeServers::error(504, 'Gateway Timeout');
+        };
+        try {
+            $this->forwarder()->forward(4711);
+        } catch (ApiException $e) {
+        }
+        $this->assertThrows(\RuntimeException::class, function (): void {
+            $this->forwarder()->forward(4711);
+        }, 'nicht bestaetigt');
+        $this->assertCount(1, $this->servers->tickets, 'kein zweites Ticket');
+    }
+
+    public function testFollowUpUsesCurrentGroupOfZammadTicket(): void
+    {
+        $this->forwarder()->forward(4711);
+        // Agenten haben das Ticket in eine Gruppe ohne E-Mail-Adresse verschoben.
+        $this->servers->tickets[55]['group_id'] = 1;
+        $this->servers->znunyTicket['Article'][] = [
+            'ArticleID' => '130', 'SenderType' => 'customer', 'CommunicationChannel' => 'Email', 'IsVisibleForCustomer' => '1',
+            'From' => 'max.muster@acme.example', 'To' => 'support@firma.example', 'Subject' => 'Re', 'Body' => 'Nachfrage',
+        ];
+        $this->assertSame('followup', $this->forwarder()->forward(4711)['status']);
+        $last = $this->servers->sentArticles()[count($this->servers->sentArticles()) - 1];
+        $this->assertSame(130, $last['preferences']['znuny_article_id']);
+        $this->assertSame('note', $last['type'], 'E-Mail-Artikel wuerde Zammad in einer Gruppe ohne Adresse ablehnen');
+    }
+
+    public function testUnknownFollowUpStateIsReported(): void
+    {
+        $this->forwarder()->forward(4711);
+        $this->servers->tickets[55]['state_id'] = 4;
+        $this->servers->znunyTicket['Article'][] = [
+            'ArticleID' => '131', 'SenderType' => 'customer', 'CommunicationChannel' => 'Email', 'IsVisibleForCustomer' => '1',
+            'From' => 'max.muster@acme.example', 'To' => 'support@firma.example', 'Subject' => 'Re', 'Body' => 'Hallo?',
+        ];
+        $result = $this->forwarder(['zammad' => ['followup_state' => 'gibtsnicht']])->forward(4711);
+        $this->assertSame('followup', $result['status']);
+        $this->assertStringContains('"gibtsnicht" (zammad.followup_state) nicht gefunden', implode("\n", $result['warnings']));
+        $this->assertSame(4, $this->servers->tickets[55]['state_id']);
+    }
+
+    public function testLostResponseOfZnunyNoteCreatesNoDuplicate(): void
+    {
+        // Znuny speichert die Notiz, die Antwort geht aber verloren.
+        $this->servers->znunyUpdateHandler = function (array $request) {
+            $body = FakeHttpClient::body($request);
+            if (!isset($body['Article'])) {
+                return null;
+            }
+            $this->servers->znunyUpdateHandler = null;
+            $this->servers->znunyTicket['Article'][] = [
+                'ArticleID' => '900', 'SenderType' => 'agent', 'CommunicationChannel' => 'Internal', 'IsVisibleForCustomer' => '0',
+                'Subject' => $body['Article']['Subject'], 'Body' => $body['Article']['Body'],
+            ];
+
+            return FakeServers::error(504, 'Gateway Timeout');
+        };
+        $result = $this->forwarder()->forward(4711);
+        $this->assertTrue($result['source_update_failed']);
+        $notes = count(array_filter($this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'), static function (array $r): bool {
+            return isset(FakeHttpClient::body($r)['Article']);
+        }));
+        $this->assertSame(1, $notes);
+
+        $result = $this->forwarder()->forward(4711);
+        $this->assertSame('source-updated', $result['status']);
+        $patches = $this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~');
+        $this->assertCount(2, $patches, 'nur noch der Status, keine zweite Notiz');
+        $this->assertTrue(isset(FakeHttpClient::body($patches[1])['Ticket']));
+        foreach ($this->servers->sentArticles() as $article) {
+            $this->assertFalse(($article['preferences']['znuny_article_id'] ?? 0) === 900, 'eigene Notiz nicht nach Zammad kopiert');
+        }
+        $this->assertSame([900], $this->state()['znuny_note_ids']);
+    }
+
+    public function testTransientStateRestoreFailureIsRetried(): void
+    {
+        // Ein Zammad-Trigger aendert den Status nach einem Kundenartikel; die Korrektur scheitert einmal mit 503.
+        $this->servers->failArticleCall[4] = function (array $request) {
+            $body = FakeHttpClient::body($request);
+            $this->servers->articles[] = ['id' => 3000, 'ticket_id' => 55] + $body;
+            $this->servers->tickets[55]['state_id'] = 2;
+
+            return FakeHttpClient::json(['id' => 3000], 201);
+        };
+        $this->servers->ticketUpdateHandler = function () {
+            $this->servers->ticketUpdateHandler = null;
+
+            return FakeServers::error(503, 'Service Unavailable');
+        };
+        $this->assertThrows(ApiException::class, function (): void {
+            $this->forwarder(['zammad' => ['state' => 'pending reminder']])->forward(4711);
+        }, '503');
+        $this->assertFalse($this->state()['complete'], 'unvollstaendig, damit der naechste Lauf weitermacht');
+        $this->assertCount(0, $this->servers->http->requestsMatching('PATCH', '~/Ticket/4711$~'));
+
+        $result = $this->forwarder(['zammad' => ['state' => 'pending reminder']])->forward(4711);
+        $this->assertSame('resumed', $result['status']);
+        $this->assertSame(3, $this->servers->tickets[55]['state_id']);
+        $this->assertTrue($this->state()['complete']);
+    }
+
     public function testCustomerStoredWithPunycodeIsFound(): void
     {
         $this->servers->znunyTicket['CustomerUserID'] = 'max@müller.de';

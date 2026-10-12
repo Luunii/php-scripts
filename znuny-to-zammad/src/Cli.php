@@ -328,11 +328,29 @@ final class Cli
                     $groups['Gruppe fuer Queue "' . $queue . '"'] = (string) $groupName;
                 }
             }
+            if (!empty($config['zammad']['group_from_queue'])) {
+                // Batch-Tickets liegen in der Batch-Queue - ihr Name bestimmt die Gruppe, sofern nicht zugeordnet.
+                foreach ((array) $config['batch']['queues'] as $queue) {
+                    if (Forwarder::mapValue((array) $config['zammad']['group_map'], (string) $queue) !== null) {
+                        continue;
+                    }
+                    if ($zammad->findGroup((string) $queue) === null) {
+                        $logger->info(sprintf('Zammad: keine Gruppe "%s" - Tickets aus dieser Batch-Queue gehen in die Standardgruppe.', $queue));
+                    } else {
+                        $groups['Gruppe fuer Batch-Queue "' . $queue . '"'] = (string) $queue;
+                    }
+                }
+            }
             foreach ($groups as $label => $groupName) {
                 $group = $zammad->findGroup($groupName);
                 if ($group === null) {
                     $ok = false;
                     $logger->error(sprintf('Zammad: %s "%s" nicht gefunden.', $label, $groupName));
+                    continue;
+                }
+                if (array_key_exists('active', $group) && !$group['active']) {
+                    $ok = false;
+                    $logger->error(sprintf('Zammad: %s "%s" ist deaktiviert.', $label, $group['name']));
                     continue;
                 }
                 $logger->info(sprintf(
@@ -522,7 +540,7 @@ Optionen:
       --customer=E-MAIL    Kunde in Zammad (statt Ermittlung aus dem Znuny-Ticket)
       --articles=MODUS     all (Standard), first oder last
       --no-internal        Interne Artikel nicht uebernehmen
-      --no-attachments     Keine Anhaenge uebernehmen
+      --no-attachments     Keine Anhaenge (auch keine eingebetteten Bilder) uebernehmen
       --no-source-update   Znuny-Ticket diesmal nicht aendern (ein spaeterer Aufruf holt es nach)
   -n, --dry-run            Nur anzeigen, was passieren wuerde
       --force              Als neues Zammad-Ticket weiterleiten, auch wenn schon geschehen

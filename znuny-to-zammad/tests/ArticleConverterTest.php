@@ -291,6 +291,18 @@ final class ArticleConverterTest extends TestCase
         $this->assertStringContains('<p>Text<img alt="l" src="data:image/png;base64,TA=="></p>', $payload['body']);
     }
 
+    public function testNoAttachmentsAlsoMeansNoEmbeddedImages(): void
+    {
+        $article = $this->htmlArticle('<p>Text<img src="cid:logo@x"></p>', [
+            ['Filename' => 'logo.png', 'ContentType' => 'image/png', 'ContentID' => '<logo@x>', 'Disposition' => 'inline', 'FilesizeRaw' => '1', 'Content' => base64_encode('L')],
+        ]);
+        $payload = $this->converter(['attachments' => false])->convert($article, true)['payload'];
+        $this->assertSame('text/html', $payload['content_type']);
+        $this->assertStringNotContains('data:image', $payload['body']);
+        $this->assertFalse(isset($payload['attachments']));
+        $this->assertStringContains('logo.png (1 Bytes, Anhaenge deaktiviert)', $payload['body']);
+    }
+
     public function testRepeatedInlineImageCountsEveryCopy(): void
     {
         $mb      = 1024 * 1024;
